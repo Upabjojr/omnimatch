@@ -260,3 +260,27 @@ def test_many_to_one(subject, patterns):
     assert matches == [], "Subject {!s} and pattern {!s} yielded unexpected matches".format(
         subject, pattern
     )
+
+
+@pytest.mark.parametrize('patterns', [
+    # plain (non-commutative) automaton
+    [Pattern(f(a)), Pattern(f(a, b)), Pattern(f(x_))],
+    # a commutative head puts a CommutativeMatcher on a state, which is the path
+    # that draws the "Sub Matcher" boxes
+    [Pattern(f_c(a, b)), Pattern(f_c(a, x_)), Pattern(f(f_c(a, b), x_))],
+])
+def test_as_graph_renders(patterns):
+    """`as_graph` must stay in step with the matcher's internals.
+
+    It is presentation-only code, so nothing else exercises it; it silently broke
+    once already when `CommutativeMatcher.patterns` values became `_PatternValue`
+    objects and the drawing code was still tuple-unpacking them.
+    """
+    graphviz = pytest.importorskip('graphviz')
+
+    matcher = ManyToOneMatcher(*patterns)
+    graph = matcher.as_graph()
+
+    assert isinstance(graph, graphviz.Digraph)
+    # force the DOT body to be generated -- node/edge labels are built lazily
+    assert 'digraph' in graph.source
