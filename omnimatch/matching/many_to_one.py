@@ -1059,13 +1059,16 @@ class ManyToOneMatcher(TypedModel):
                 if has_states:
                     graph.subgraph(state.matcher.automaton._as_graph(subfinals))
                 submatch_label = '<<b>Sub Matcher End</b>' if has_states else '<<b>Sub Matcher</b>'
-                for pattern_index, subpatterns, variables in state.matcher.patterns.values():
+                # CommutativeMatcher.patterns maps _PatternKey -> _PatternValue. The
+                # value used to be a plain (index, pattern_set, variables) tuple, so
+                # read it by attribute rather than unpacking it.
+                for pattern_value in state.matcher.patterns.values():
                     var_formatted = ', '.join(
                         '{}[{}]x{}{}{}'.format(self._colored_variable(n), m, c, 'W' if w else '', ': {}'.format(d) if d is not None else '')
-                        for (n, c, m, d), w in variables
+                        for (n, c, m, d), w in pattern_value.variables
                     )
                     submatch_label += '<br/>\n{}: {} {}'.format(
-                        self._colored_pattern(pattern_index), subpatterns, var_formatted
+                        self._colored_pattern(pattern_value.index), pattern_value.pattern_set, var_formatted
                     )
                 submatch_label += '>'
                 end_name = (name + '-end') if has_states else name
