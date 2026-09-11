@@ -289,8 +289,10 @@ class CommutativeMatcher{0}(CommutativeMatcher):
         if isinstance(operation, OperationHead):
             # Store OperationHead as a module-level variable in the generated code
             var_name = '_op_head_' + re.sub(r'\W', '_', operation.name)
-            head_repr = 'OperationHead(name={!r}, arity=Arity({}, {}), commutative={!r}, associative={!r}, one_identity={!r}, infix={!r})'.format(
-                operation.name, operation.arity.min_count, operation.arity.fixed_size,
+            # Reference the Arity member by name: Arity(min_count, fixed_size) only
+            # works on Python 3.12+ (older versions read the 2nd arg as enum names).
+            head_repr = 'OperationHead(name={!r}, arity=Arity.{}, commutative={!r}, associative={!r}, one_identity={!r}, infix={!r})'.format(
+                operation.name, operation.arity.name,
                 operation.commutative, operation.associative, operation.one_identity, operation.infix
             )
             assign_line = '{} = {}'.format(var_name, head_repr)
