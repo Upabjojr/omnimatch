@@ -17,8 +17,24 @@ like ``dataclasses.field`` / Pydantic ``Field``.
 """
 import typing
 
+try:
+    import annotationlib
+except ImportError:  # Python < 3.14
+    annotationlib = None
+
 _MISSING = object()
 _NoneType = type(None)
+
+
+def _own_annotations(klass):
+    """Annotations declared directly in ``klass``'s body (not inherited)."""
+    if annotationlib is None:
+        return klass.__dict__.get('__annotations__', {})
+    # Python 3.14+ (PEP 649/749) evaluates annotations lazily: the class __dict__
+    # holds an ``__annotate__`` function instead of ``__annotations__``. FORWARDREF
+    # keeps names that don't resolve as ForwardRef objects (unchecked) instead of
+    # raising NameError.
+    return annotationlib.get_annotations(klass, format=annotationlib.Format.FORWARDREF)
 
 
 class _FieldSpec:
@@ -74,7 +90,7 @@ def _resolve_fields(cls):
         return cached
     fields = {}
     for klass in reversed(cls.__mro__):  # base-to-derived so subclasses override
-        for name, typ in klass.__dict__.get('__annotations__', {}).items():
+        for name, typ in _own_annotations(klass).items():
             if name.startswith('_'):  # private attrs are not fields
                 continue
             if typ is typing.ClassVar or typing.get_origin(typ) is typing.ClassVar:
