@@ -14,6 +14,9 @@ from .matching import *
 
 __all__ = expressions.__all__ + functions.__all__ + utils.__all__ + matching.__all__
 
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions
+from importlib import metadata as _metadata
+try:
+    __version__ = _metadata.version(__name__)
+except _metadata.PackageNotFoundError:  # not installed, e.g. imported from a source tree
+    __version__ = '0+unknown'
+del _metadata
