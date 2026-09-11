@@ -143,7 +143,10 @@ class TestSolveLinearDiop:
 
     @given(st.lists(st.integers(min_value=1, max_value=100), max_size=5), st.integers(min_value=0, max_value=100))
     @example([1, 2, 2], 4)
-    @settings(deadline=400)
+    # No deadline: the brute-force oracle below dominates the runtime (e.g. ~680k
+    # combinations for coeffs=[1, 2, 2, 2], c=49 while the solver takes ~1ms), so a
+    # deadline only makes the test flaky on slow machines such as CI runners.
+    @settings(deadline=None)
     def test_completeness(self, coeffs, c):
         self._limit_possible_solution_count(coeffs, c)
         solutions = set(solve_linear_diop(c, *coeffs))
