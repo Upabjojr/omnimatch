@@ -55,6 +55,8 @@ class Expression(TypedModel):
                 return False
             if expr.variable_name is not None:
                 return False
+            if isinstance(expr, Operation) and isinstance(expr.head, WildcardOperationHead):
+                return False
         return True
 
     @property

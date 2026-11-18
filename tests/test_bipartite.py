@@ -146,3 +146,47 @@ class TestBipartiteGraphTest:
         assert not {(1, 2): True} == BipartiteGraph({(1, 1): True})
         assert not BipartiteGraph() == ''
         assert not '' == BipartiteGraph()
+
+
+def _brute_force_maximum_matchings(edges):
+    """All maximum matchings of the bipartite graph with the given edge list, by brute force."""
+    best = set()
+    for size in range(len(edges), 0, -1):
+        for subset in itertools.combinations(edges, size):
+            lefts = {l for l, _ in subset}
+            rights = {r for _, r in subset}
+            if len(lefts) == len(rights) == size:
+                best.add(frozenset(subset))
+        if best:
+            break
+    return best
+
+
+@pytest.mark.parametrize(
+    '   edges,                          expected',
+    [
+        # A right vertex that can be left free: previously only {0: 0} was produced.
+        ([(0, 0), (0, 1)],              [{0: 0}, {0: 1}]),
+        ([(0, 0), (0, 1), (0, 2)],      [{0: 0}, {0: 1}, {0: 2}]),
+        ([(0, 0), (1, 0)],              [{0: 0}, {1: 0}]),
+        ([(0, 0), (0, 1), (1, 1)],      [{0: 0, 1: 1}]),
+        ([(0, 0), (1, 1), (1, 2)],      [{0: 0, 1: 1}, {0: 0, 1: 2}]),
+    ]
+)
+def test_enum_maximum_matchings_iter_leaves_right_vertex_free(edges, expected):
+    graph = BipartiteGraph((edge, True) for edge in edges)
+    result = list(enum_maximum_matchings_iter(graph))
+    assert sorted(map(sorted, (m.items() for m in result))) == sorted(map(sorted, (m.items() for m in expected)))
+
+
+@pytest.mark.parametrize('n, m', [(n, m) for n in range(1, 4) for m in range(1, 4)])
+def test_enum_maximum_matchings_iter_exhaustive(n, m):
+    """Compare against brute force on every bipartite graph with n left and m right vertices."""
+    all_edges = list(itertools.product(range(n), range(m)))
+    for mask in range(1 << len(all_edges)):
+        edges = [e for i, e in enumerate(all_edges) if mask >> i & 1]
+        graph = BipartiteGraph((edge, True) for edge in edges)
+        result = [frozenset(matching.items()) for matching in enum_maximum_matchings_iter(graph)]
+        expected = _brute_force_maximum_matchings(edges)
+        assert len(result) == len(set(result)), "duplicate matching for {}".format(edges)
+        assert set(result) == expected, "wrong matchings for {}".format(edges)

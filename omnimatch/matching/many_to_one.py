@@ -413,7 +413,15 @@ class _MatchIter:
             return
         if isinstance(label, LabelTypeOperation):
             if transition.target.matcher:
-                yield from self._match_commutative_operation(transition.target)
+                if transition.variable_name is None and transition.subst is None:
+                    yield from self._match_commutative_operation(transition.target)
+                elif self.subjects:
+                    # A named (or default-carrying) commutative subpattern: bind the
+                    # whole subject operation and check its constraints first, exactly
+                    # as _check_transition does for any other transition.
+                    yield from self._check_transition(
+                        transition, self.subjects[0], False,
+                        then=lambda: self._match_commutative_operation(transition.target))
             else:
                 yield from self._match_regular_operation(transition)
             return
@@ -433,7 +441,7 @@ class _MatchIter:
         subject = self.subjects.popleft() if self.subjects else None
         yield from self._check_transition(transition, subject)
 
-    def _check_transition(self, transition, subject, restore_subject=True):
+    def _check_transition(self, transition, subject, restore_subject=True, then=None):
         if self.patterns.isdisjoint(transition.patterns):
             return
         restore_constraints = set()
@@ -464,7 +472,10 @@ class _MatchIter:
                 if not self.patterns:
                     return
 
-            yield from self._match(transition.target)
+            if then is None:
+                yield from self._match(transition.target)
+            else:
+                yield from then()
 
         finally:
             if restore_subject and subject is not None:

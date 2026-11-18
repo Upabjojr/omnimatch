@@ -18,12 +18,16 @@ Covered here:
 import itertools
 
 import pytest
+from multiset import Multiset
 
 from omnimatch.expressions.expressions import (
     Arity, Operation, OperationHead, Pattern, NamedAtom, Wildcard,
     WildcardOperationHead,
 )
+from omnimatch.expressions.functions import is_constant
+from omnimatch.matching._common import CommutativePatternsParts
 from omnimatch.matching.many_to_one import ManyToOneMatcher
+from omnimatch.matching.one_to_one import match as match_one_to_one
 
 # ── a spread of concrete heads ───────────────────────────────────────────────
 SIN = OperationHead(name='SIN', arity=Arity.unary)
@@ -276,6 +280,36 @@ class TestArityAndNegatives:
 
     def test_star_operand_still_requires_an_operation(self):
         assert matches(Pattern(Operation(anyhead(), Wildcard.star('s'))), x) == []
+
+
+# =============================================================================
+# A wildcard head makes an expression non-constant
+# =============================================================================
+
+class TestIsConstant:
+
+    @pytest.mark.parametrize('expression', [
+        Operation(anyhead(), x),
+        Operation(anyhead(None), x),
+        Operation(SIN, Operation(anyhead(), x)),
+        Operation(ADD, y, Operation(anyhead(), x)),
+    ], ids=str)
+    def test_wildcard_head_is_not_constant(self, expression):
+        assert not is_constant(expression)
+        assert not expression.is_constant
+
+    def test_concrete_head_is_still_constant(self):
+        assert is_constant(Operation(SIN, x))
+        assert Operation(SIN, x).is_constant
+
+    def test_commutative_parts_do_not_treat_it_as_a_constant_operand(self):
+        parts = CommutativePatternsParts(MUL, Operation(anyhead(), x), y)
+        assert Operation(anyhead(), x) not in parts.constant
+        assert parts.constant == Multiset([y])
+
+    def test_one_to_one_rejects_a_subject_with_a_wildcard_head(self):
+        with pytest.raises(ValueError):
+            list(match_one_to_one(Operation(SIN, Operation(anyhead(), x)), Pattern(Wildcard.dot('v'))))
 
 
 # =============================================================================

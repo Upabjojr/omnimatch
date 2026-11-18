@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for the FreeOf constraint."""
 import pytest
+from multiset import Multiset
 from omnimatch.expressions.expressions import (
     Operation, NamedAtom, Wildcard, Pattern, Arity, OperationHead,
 )
@@ -14,6 +15,7 @@ from omnimatch.expressions.substitution import Substitution
 f = OperationHead(name='f', arity=Arity.binary)
 g = OperationHead(name='g', arity=Arity.unary)
 h = OperationHead(name='h', arity=Arity.variadic, commutative=True, associative=True, one_identity=True)
+fc = OperationHead(name='fc', arity=Arity.variadic, commutative=True)
 
 a = NamedAtom('a')
 b = NamedAtom('b')
@@ -192,6 +194,34 @@ class TestFreeQCommutative:
         # u would need to bind to x, which is not free of 'x'
         valid = [r for r in results if r.get('u') is not None and r['u'] != x]
         assert len(valid) == 0
+
+
+class TestFreeQMultiset:
+    """Star/plus wildcards in commutative operations bind a Multiset, which must be searched too."""
+
+    def test_multiset_value_containing_symbol(self):
+        c = FreeOf('u', 'x')
+        assert c(Substitution({'u': Multiset([x])})) is False
+        assert c(Substitution({'u': Multiset([a, x])})) is False
+        assert c(Substitution({'u': Multiset([a, Operation(g, x)])})) is False
+
+    def test_multiset_value_free_of_symbol(self):
+        c = FreeOf('u', 'x')
+        assert c(Substitution({'u': Multiset([a, b])})) is True
+        assert c(Substitution({'u': Multiset()})) is True
+
+    def test_multiset_nested_in_sequence(self):
+        assert FreeOf('u', 'x')(Substitution({'u': (a, Multiset([x]))})) is False
+
+    @pytest.mark.parametrize('subject, expected', [
+        (Operation(fc, a, b),           [{'u': Multiset([a, b])}]),
+        (Operation(fc, a, x),           []),
+        (Operation(fc, a, Operation(g, x)), []),
+    ])
+    def test_commutative_star_variable(self, subject, expected):
+        pattern = Pattern(Operation(fc, Wildcard.plus('u')), FreeOf('u', 'x'))
+        assert list(match_one_to_one(subject, pattern)) == expected
+        assert [s for _, s in ManyToOneMatcher(pattern).match(subject)] == expected
 
 
 # ─── Integration tests: FreeOf with many-to-one matching ───────────────────────

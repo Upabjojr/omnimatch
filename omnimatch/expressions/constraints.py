@@ -29,6 +29,8 @@ from collections import OrderedDict
 from typing import Callable, FrozenSet, Dict, Iterable, Tuple, Union
 from functools import cached_property
 
+from multiset import BaseMultiset
+
 from .._typed import TypedModel
 
 from . import substitution
@@ -370,7 +372,7 @@ class FreeOf(Constraint):
         from .expressions import NamedAtom, SymbolWrapper, Operation
 
         # Handle sequence variable values (tuples, lists, Multisets)
-        if isinstance(expr, (tuple, list)):
+        if isinstance(expr, (tuple, list, BaseMultiset)):
             stack = list(expr)
         else:
             stack = [expr]
@@ -385,7 +387,7 @@ class FreeOf(Constraint):
                     return False
             elif isinstance(node, Operation):
                 stack.extend(node.operands)
-            elif isinstance(node, (tuple, list)):
+            elif isinstance(node, (tuple, list, BaseMultiset)):
                 stack.extend(node)
         return True
 

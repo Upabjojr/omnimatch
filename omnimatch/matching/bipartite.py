@@ -356,19 +356,40 @@ def _enum_maximum_matchings_iter(graph: BipartiteGraph[TLeft, TRight, TEdgeValue
                     if left2 is not None:
                         break
 
-        if left2 is None:
-            return
+        if left2 is not None:
+            # Construct M'
+            # Exchange the direction of the path left1 -> right -> left2
+            # to left1 <- right <- left2 in the new matching
+            new_match = matching.copy()
+            del new_match[left1]
+            new_match[left2] = right
+            edge = (left2, right)
+        else:
+            # Mirror image: a feasible path right2 -> left1 -> right1 where right2 is
+            # NOT in the matching. Without this case, maximum matchings that differ
+            # only in which right vertex is left free are never enumerated (e.g. for
+            # the graph {(0, 0), (0, 1)} only {0: 0} was found, never {0: 1}).
+            matched_rights = set(matching.values())
+            left1 = right2 = None
+            for part, node in directed_match_graph:
+                if part == RIGHT and node not in matched_rights:
+                    for part1, node1 in directed_match_graph[(RIGHT, node)]:
+                        if part1 == LEFT and node1 in matching:
+                            left1 = cast(TLeft, node1)
+                            right2 = cast(TRight, node)
+                            break
+                    if left1 is not None:
+                        break
 
-        # Construct M'
-        # Exchange the direction of the path left1 -> right -> left2
-        # to left1 <- right <- left2 in the new matching
-        new_match = matching.copy()
-        del new_match[left1]
-        new_match[left2] = right
+            if left1 is None:
+                return
+
+            # Construct M' by moving left1 from its old partner to right2
+            new_match = matching.copy()
+            new_match[left1] = right2
+            edge = (left1, right2)
 
         yield new_match
-
-        edge = (left2, right)
 
         # Construct G+(e) and G-(e)
         graph_plus = graph.without_nodes(edge)

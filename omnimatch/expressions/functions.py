@@ -2,7 +2,7 @@
 """Utility functions for working with expression trees."""
 from typing import Iterator, Tuple, Set, Dict, Optional
 
-from .expressions import Expression, Operation, Wildcard, NamedAtom, SymbolWrapper, Pattern
+from .expressions import Expression, Operation, Wildcard, NamedAtom, SymbolWrapper, Pattern, WildcardOperationHead
 
 __all__ = [
     'is_constant', 'is_syntactic', 'is_anonymous', 'contains_variables_from_set',
@@ -12,10 +12,12 @@ __all__ = [
 
 
 def is_constant(expression: Expression) -> bool:
-    """Check if the expression is constant (contains no wildcards)."""
+    """Check if the expression is constant (contains no wildcards, including wildcard operation heads)."""
     if isinstance(expression, Wildcard):
         return False
     if isinstance(expression, Operation):
+        if isinstance(expression.head, WildcardOperationHead):
+            return False
         return all(is_constant(o) for o in expression.operands)
     return True
 

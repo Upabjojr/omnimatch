@@ -4,6 +4,7 @@ import pytest
 from omnimatch.expressions.constraints import CustomConstraint
 from omnimatch.expressions.expressions import NamedAtom, Pattern, Operation, Arity, Wildcard
 from omnimatch.matching.many_to_one import ManyToOneMatcher
+from omnimatch.matching.one_to_one import match
 from .common import *
 from .utils import MockConstraint
 
@@ -284,3 +285,56 @@ def test_as_graph_renders(patterns):
     assert isinstance(graph, graphviz.Digraph)
     # force the DOT body to be generated -- node/edge labels are built lazily
     assert 'digraph' in graph.source
+
+
+def _named(head, *operands, name):
+    return head(*operands, variable_name=name)
+
+
+@pytest.mark.parametrize(
+    '   pattern,                                                subject,                        expected',
+    [
+        # A named commutative subexpression is bound in addition to its operands.
+        (f(_named(f_c, a, b, name='y')),                       f(f_c(a, b)),                   [{'y': f_c(a, b)}]),
+        (f(_named(f_c, a, x_, name='y')),                      f(f_c(b, a)),                   [{'x': b, 'y': f_c(a, b)}]),
+        (f(_named(f_c, a, x_, name='y'), b),                   f(f_c(a, c), b),                [{'x': c, 'y': f_c(a, c)}]),
+        (f(_named(f_c, a, x_, name='y')),                      f(f_c(b, c)),                   []),
+        # Top level.
+        (_named(f_c, a, x_, name='y'),                         f_c(a, b),                      [{'x': b, 'y': f_c(a, b)}]),
+        # Nested in another commutative operation.
+        (f_c(_named(f2_c, a, x_, name='y'), b),                f_c(b, f2_c(c, a)),             [{'x': c, 'y': f2_c(a, c)}]),
+        # The bound value must agree with other occurrences of the variable.
+        (f(_named(f_c, a, b, name='y'), y_),                   f(f_c(a, b), f_c(a, b)),        [{'y': f_c(a, b)}]),
+        (f(_named(f_c, a, b, name='y'), y_),                   f(f_c(a, b), a),                []),
+        (f(y_, _named(f_c, a, b, name='y')),                   f(a, f_c(a, b)),                []),
+    ]
+)
+def test_named_commutative_operation_is_bound(pattern, subject, expected):
+    pattern = Pattern(pattern)
+    one_to_one = list(match(subject, pattern))
+    many_to_one = [s for _, s in ManyToOneMatcher(pattern).match(subject)]
+    assert one_to_one == expected
+    assert many_to_one == expected
+
+
+def test_constraint_on_named_commutative_operation():
+    only_ab = CustomConstraint(lambda y: y == f_c(a, b))
+    pattern1 = Pattern(f(_named(f_c, a, x_, name='y')), only_ab)
+    pattern2 = Pattern(f(_named(f_c, a, x_, name='y')))
+    matcher = ManyToOneMatcher(pattern1, pattern2)
+
+    results = sorted((str(p), s) for p, s in matcher.match(f(f_c(a, b))))
+    assert [s for _, s in results] == [{'x': b, 'y': f_c(a, b)}] * 2
+
+    results = list(matcher.match(f(f_c(a, c))))
+    assert len(results) == 1
+    assert results[0][0] == pattern2
+    assert results[0][1] == {'x': c, 'y': f_c(a, c)}
+
+
+def test_same_commutative_operation_named_and_unnamed():
+    pattern1 = Pattern(f(_named(f_c, a, x_, name='y')))
+    pattern2 = Pattern(f(f_c(a, x_)))
+    matcher = ManyToOneMatcher(pattern1, pattern2)
+    results = {p: s for p, s in matcher.match(f(f_c(a, b)))}
+    assert results == {pattern1: {'x': b, 'y': f_c(a, b)}, pattern2: {'x': b}}
