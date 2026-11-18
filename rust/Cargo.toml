@@ -1,0 +1,12 @@
+[package]
+name = "omnimatch"
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.70"
+description = "Pattern matching for symbolic expressions (Rust port of the omnimatch Python package)"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+
+[dev-dependencies]

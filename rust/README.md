@@ -1,0 +1,83 @@
+# omnimatch (Rust port)
+
+A work-in-progress Rust port of the `omnimatch` Python package in the parent
+directory. It has no dependencies (the Python `multiset` package is replaced by
+`src/multiset.rs`).
+
+```
+cargo test      # unit tests, ported one-to-one matching tests, doctests
+cargo clippy --all-targets
+```
+
+## Status
+
+| Python module                           | Rust                                | Status |
+|-----------------------------------------|-------------------------------------|--------|
+| `expressions/expressions.py`            | `src/expressions.rs`                | ported, except `SymbolWrapper`, `WildcardOperationHead`, `to_/from_omnimatch_expression` |
+| `expressions/substitution.py`           | `src/substitution.rs`               | ported |
+| `expressions/constraints.py`            | `src/constraints.rs`                | ported (`EqualVariablesConstraint`, `CustomConstraint`, `FreeOf`) |
+| `expressions/functions.py`              | methods on `Expr`, `matching/common.rs` | ported |
+| `utils.py` (combinatorics)              | `src/utils.rs`                      | ported; Python-only helpers (lambda source, cached properties, `generator_chain`) dropped |
+| `matching/_common.py`                   | `src/matching/common.rs`            | ported |
+| `matching/one_to_one.py`                | `src/matching/one_to_one.rs`        | ported |
+| `functions.py`                          | `src/functions.rs`                  | ported, except `replace_many` |
+| `matching/hopcroft_karp.py`            | `src/matching/hopcroft_karp.rs`     | ported (same matchings as Python on the Python test cases) |
+| `matching/bipartite.py`                 | `src/matching/bipartite.rs`         | ported, except the graphviz helpers |
+| `matching/many_to_one.py`               | –                                   | not yet (the biggest piece, ~1600 lines) |
+| `matching/code_generation.py`           | –                                   | not yet; may not make sense in Rust |
+| `matching/json_serialization.py`        | –                                   | not yet (would add a `serde` dependency) |
+| `_typed.py`                             | –                                   | not needed |
+
+`tests/one_to_one.rs` ports the one-to-one tables from `tests/test_matching.py`
+(constant, commutative, dot, optional, associative, star/plus/mixed sequence
+wildcards, one-identity, variable names, constraints).
+
+## Design
+
+* **Expressions.** `Expr` is an immutable, reference-counted node whose
+  `ExprKind` is `Atom`, `Wildcard` or `Operation`. Operation metadata is an
+  `OperationHead` shared through `Head`. As in Python there are two
+  constructors: `Expr::try_operation` (raw: flattens associative operands and
+  sorts commutative ones) and `Head::call` (the factory, which also applies
+  `one_identity`). `Head::builder(..).build()` does the validation that
+  `Operation.new` does.
+* **Ordering.** `Ord for Expr` is Python's `__lt__` (atoms < wildcards <
+  operations, …), extended with tie-breaks so that it is a total order
+  consistent with `Eq`.
+* **Replacements.** A variable is bound to a `Replacement`: `Single(Expr)`,
+  `Sequence(Vec<Expr>)` or `Multiset(Multiset<Expr>)`, matching Python's
+  expression / tuple / `Multiset`.
+* **Matching.** Python's chain of lazy generators is written in
+  continuation-passing style: every step takes a callback that it calls once per
+  partial match, and the callback can return `ControlFlow::Break` to stop early.
+  The search order is the same as in Python. Entry points: `match_pattern`
+  (all matches), `for_each_match` (streaming), `first_match`, `is_match`,
+  `match_anywhere`.
+* **Errors.** Python's `ValueError`/`IndexError` become `Result`s
+  (`ExprError`, `MatchError`, `RewriteError`). `Head::call` and
+  `Expr::operation` are panicking shorthands for when the arity is known to be right.
+
+## Differences from the Python package
+
+* `CustomConstraint` cannot read variable names from a closure's parameters, so
+  they are given explicitly and the closure receives the replacements in that
+  order: `CustomConstraint::new(["x", "y"], |args| ...)`.
+* Local constraints are not removed from the active set once checked (Python
+  removes them and restores them on backtracking). Every constraint whose
+  variables are all bound is checked at each binding point. The matches are the
+  same; a constraint may just be evaluated more often.
+* `FreeOf` also checks multiset-valued bindings. The Python `_is_free` only looks
+  inside tuples and lists, so it accepts any multiset (looks like a bug there).
+* Unnamed star wildcards in `one_identity` patterns are not bound under a
+  `None` key, which the Python version does.
+* `enum_maximum_matchings` also handles maximum matchings that leave a *right*
+  vertex free. The Python `_enum_maximum_matchings_iter` (Step 8) only looks for
+  alternating paths ending at a free left vertex, so for the graph
+  `{(0, 0), (0, 1)}` it yields `{0: 0}` but never `{0: 1}`. `many_to_one` is
+  not affected: it puts patterns on the right and requires them all to be
+  matched. The Rust tests check the enumeration exhaustively against brute
+  force on every graph with up to 4 + 4 vertices.
+* `BipartiteGraph` keeps its edges in sorted order (Python: insertion order), so
+  enumeration order can differ.
+* `SymbolWrapper` (wrapping host-language objects) is not ported. Atoms are
+  identified by name only.

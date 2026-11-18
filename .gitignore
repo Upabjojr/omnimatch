@@ -9,3 +9,6 @@ build/
 htmlcov/
 docs/api/
 .idea/
+
+# Rust port
+rust/target/
