@@ -40,7 +40,11 @@ As in Python's `conftest.py`, every table runs through both matchers, and
 of that subject's patterns (Python: `test_many_to_one`). `tests/wildcard_head.rs`
 and `tests/functions.rs` port `test_wildcard_operation_head.py` and
 `test_functions.py` (including the logic-simplification rewrite system, run
-through both `replace_all` and `ManyToOneReplacer`).
+through both `replace_all` and `ManyToOneReplacer`). `tests/expressions.rs`,
+`tests/freeof.rs`, `tests/constraints.rs` and `tests/utils.rs` port the
+remaining test files. Python-only tests (lambda source extraction, cached
+properties, slices, `repr`) are skipped with a note at the top of each file,
+and hypothesis tests became exhaustive loops over small ranges.
 
 ## Design
 
