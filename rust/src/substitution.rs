@@ -6,7 +6,7 @@ use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use crate::expressions::{Expr, ExprKind};
+use crate::expressions::{Expr, ExprKind, Head};
 use crate::multiset::Multiset;
 
 /// The value bound to a variable.
@@ -21,15 +21,20 @@ pub enum Replacement {
     Sequence(Vec<Expr>),
     /// An unordered collection (sequence wildcards in commutative operations).
     Multiset(Multiset<Expr>),
+    /// An operation head (bound by a wildcard head, see [`Head::any`](crate::Head::any);
+    /// Python wraps it in a `SymbolWrapper`).
+    Head(Head),
 }
 
 impl Replacement {
-    /// The bound expressions as a list (a single expression becomes a one-element list).
+    /// The bound expressions as a list (a single expression becomes a
+    /// one-element list, a head an empty one).
     pub fn to_vec(&self) -> Vec<Expr> {
         match self {
             Replacement::Single(e) => vec![e.clone()],
             Replacement::Sequence(v) => v.clone(),
             Replacement::Multiset(m) => m.iter().cloned().collect(),
+            Replacement::Head(_) => Vec::new(),
         }
     }
 
@@ -41,7 +46,14 @@ impl Replacement {
     }
 
     fn is_collection(&self) -> bool {
-        !matches!(self, Replacement::Single(_))
+        matches!(self, Replacement::Sequence(_) | Replacement::Multiset(_))
+    }
+
+    pub fn as_head(&self) -> Option<&Head> {
+        match self {
+            Replacement::Head(h) => Some(h),
+            _ => None,
+        }
     }
 }
 
@@ -78,6 +90,7 @@ impl fmt::Display for Replacement {
                 write!(f, ")")
             }
             Replacement::Multiset(m) => write!(f, "{m}"),
+            Replacement::Head(h) => write!(f, "{}", h.name),
         }
     }
 }
@@ -169,7 +182,7 @@ impl Substitution {
                 }
                 Ok(())
             }
-            Replacement::Single(_) => {
+            Replacement::Single(_) | Replacement::Head(_) => {
                 if &replacement == existing {
                     Ok(())
                 } else {

@@ -1,6 +1,6 @@
 //! Substitution and rewriting.
 //!
-//! Port of `omnimatch/functions.py` (except `replace_many`, not ported yet).
+//! Port of `omnimatch/functions.py`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -49,10 +49,46 @@ impl From<MatchError> for RewriteError {
 /// multiset is spliced in sorted order. The result is a sequence only if
 /// `expression` itself is a variable bound to one.
 pub fn substitute(expression: &Expr, substitution: &Substitution) -> Result<Replacement, ExprError> {
-    Ok(substitute_rec(expression, substitution)?.0)
+    Ok(substitute_rec(expression, substitution, None)?.0)
 }
 
-fn substitute_rec(expression: &Expr, substitution: &Substitution) -> Result<(Replacement, bool), ExprError> {
+/// Like [`substitute`], but multisets are spliced in the order given by
+/// `compare` instead of the canonical one (Python: the `sort_key` argument).
+pub fn substitute_sorted_by(
+    expression: &Expr,
+    substitution: &Substitution,
+    compare: &dyn Fn(&Expr, &Expr) -> std::cmp::Ordering,
+) -> Result<Replacement, ExprError> {
+    Ok(substitute_rec(expression, substitution, Some(compare))?.0)
+}
+
+type Compare<'c> = Option<&'c dyn Fn(&Expr, &Expr) -> std::cmp::Ordering>;
+
+/// Append `replacement` to `operands`, splicing sequences and multisets.
+fn splice(operands: &mut Vec<Expr>, replacement: Replacement, compare: Compare<'_>) -> Result<(), ExprError> {
+    match replacement {
+        Replacement::Single(e) => operands.push(e),
+        Replacement::Sequence(v) => operands.extend(v),
+        Replacement::Multiset(m) => {
+            // Multiset iteration is already in canonical order.
+            let mut items: Vec<Expr> = m.iter().cloned().collect();
+            if let Some(compare) = compare {
+                items.sort_by(|a, b| compare(a, b));
+            }
+            operands.extend(items);
+        }
+        Replacement::Head(h) => {
+            return Err(ExprError::InvalidPosition(format!("cannot use the head {} as an operand", h.name)))
+        }
+    }
+    Ok(())
+}
+
+fn substitute_rec(
+    expression: &Expr,
+    substitution: &Substitution,
+    compare: Compare<'_>,
+) -> Result<(Replacement, bool), ExprError> {
     if let Some(replacement) = expression.variable_name().and_then(|v| substitution.get(v)) {
         return Ok((replacement.clone(), true));
     }
@@ -60,16 +96,19 @@ fn substitute_rec(expression: &Expr, substitution: &Substitution) -> Result<(Rep
         let mut any_replaced = false;
         let mut new_operands = Vec::with_capacity(operands.len());
         for operand in operands {
-            let (result, replaced) = substitute_rec(operand, substitution)?;
+            let (result, replaced) = substitute_rec(operand, substitution, compare)?;
             any_replaced |= replaced;
-            match result {
-                Replacement::Single(e) => new_operands.push(e),
-                // Multiset iteration is already sorted.
-                other => new_operands.extend(other.to_vec()),
-            }
+            splice(&mut new_operands, result, compare)?;
         }
+        // A wildcard head whose variable is bound to a head takes that head.
+        let bound_head = match head.head_variable.as_deref().and_then(|v| substitution.get(v)) {
+            Some(Replacement::Head(h)) if head.wildcard => Some(h.clone()),
+            _ => None,
+        };
+        any_replaced |= bound_head.is_some();
         if any_replaced {
-            let rebuilt = Expr::try_operation(head.clone(), new_operands, expression.variable_name())?;
+            let head = bound_head.unwrap_or_else(|| head.clone());
+            let rebuilt = Expr::try_operation(head, new_operands, expression.variable_name())?;
             return Ok((Replacement::Single(rebuilt), true));
         }
     }
@@ -90,8 +129,76 @@ pub fn replace(expression: &Expr, position: &[usize], replacement: Replacement) 
     }
     let sub = replace(&operands[pos], rest, replacement)?;
     let mut new_operands: Vec<Expr> = operands[..pos].to_vec();
-    new_operands.extend(sub.to_vec());
+    splice(&mut new_operands, sub, None)?;
     new_operands.extend_from_slice(&operands[pos + 1..]);
+    Ok(Replacement::Single(Expr::try_operation(head.clone(), new_operands, expression.variable_name())?))
+}
+
+/// Replace several positions at once. Unlike calling [`replace`] repeatedly,
+/// positions refer to the original expression even when earlier replacements
+/// are sequences that shift later operands.
+///
+/// ```
+/// use omnimatch::*;
+/// let f = Head::new("f", Arity::Variadic).unwrap();
+/// let (a, b, c) = (Expr::atom("a"), Expr::atom("b"), Expr::atom("c"));
+/// let expr = f.call(vec![a.clone(), b]);
+/// let r = replace_many(&expr, vec![(vec![0], Replacement::Sequence(vec![c.clone(), c])), (vec![1], a.into())]);
+/// assert_eq!(r.unwrap().to_string(), "f(c, c, a)");
+/// ```
+pub fn replace_many(
+    expression: &Expr,
+    mut replacements: Vec<(Vec<usize>, Replacement)>,
+) -> Result<Replacement, ExprError> {
+    if replacements.is_empty() {
+        return Ok(Replacement::Single(expression.clone()));
+    }
+    replacements.sort_by(|x, y| x.0.cmp(&y.0));
+    if replacements[0].0.is_empty() {
+        if replacements.len() > 1 {
+            return Err(ExprError::InvalidPosition(format!(
+                "Cannot replace child positions for expression {expression}, got {:?}",
+                replacements[1..].iter().map(|r| &r.0).collect::<Vec<_>>()
+            )));
+        }
+        return Ok(replacements.pop().expect("one replacement").1);
+    }
+    if replacements.len() == 1 {
+        let (position, replacement) = replacements.pop().expect("one replacement");
+        return replace(expression, &position, replacement);
+    }
+    let Some((head, operands)) = expression.as_operation() else {
+        return Err(ExprError::InvalidPosition(format!("Invalid replacements for expression {expression}")));
+    };
+    let mut new_operands = Vec::new();
+    let mut last_index = 0;
+    let mut iter = replacements.into_iter().peekable();
+    while let Some((position, replacement)) = iter.next() {
+        let index = position[0];
+        if index >= operands.len() {
+            return Err(ExprError::InvalidPosition(format!(
+                "Position {position:?} out of range for expression {expression}"
+            )));
+        }
+        let mut group = vec![(position[1..].to_vec(), replacement)];
+        while let Some((p, _)) = iter.peek() {
+            if p[0] != index {
+                break;
+            }
+            let (p, r) = iter.next().expect("peeked");
+            group.push((p[1..].to_vec(), r));
+        }
+        new_operands.extend_from_slice(&operands[last_index..index]);
+        let replaced = if group.len() == 1 {
+            let (p, r) = group.pop().expect("one replacement");
+            replace(&operands[index], &p, r)?
+        } else {
+            replace_many(&operands[index], group)?
+        };
+        splice(&mut new_operands, replaced, None)?;
+        last_index = index + 1;
+    }
+    new_operands.extend_from_slice(&operands[last_index..]);
     Ok(Replacement::Single(Expr::try_operation(head.clone(), new_operands, expression.variable_name())?))
 }
 

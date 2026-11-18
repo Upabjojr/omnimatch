@@ -157,7 +157,9 @@ pub fn check_one_identity(pattern: &Expr) -> Option<(Expr, Substitution)> {
 pub fn match_head(subject: &Expr, pattern: &Expr) -> bool {
     match pattern.kind() {
         ExprKind::Wildcard(_) => true,
-        ExprKind::Operation { head, .. } => head.one_identity || subject.head() == Some(head),
+        ExprKind::Operation { head, .. } => {
+            head.one_identity || (head.wildcard && subject.is_operation()) || subject.head() == Some(head)
+        }
         ExprKind::Atom { .. } => subject.is_atom(),
     }
 }

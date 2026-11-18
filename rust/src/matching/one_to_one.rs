@@ -173,9 +173,21 @@ fn match_(subjects: &[Expr], pattern: &Expr, subst: Substitution, cx: &Ctx, k: K
                 match_one_identity(subjects, pattern, &subst, cx, k)?;
             }
             let [subject] = subjects else { return CONTINUE };
-            if subject.head() != Some(head) {
+            let Some(subject_head) = subject.head() else { return CONTINUE };
+            if !(head.wildcard || subject_head == head) {
                 return CONTINUE;
             }
+            // A wildcard head matches any head and binds it (Python only
+            // supports wildcard heads in the many-to-one matcher).
+            let subst = match head.head_variable.as_deref() {
+                Some(head_var) if head.wildcard => {
+                    match subst.union_with_variable(head_var, Replacement::Head(subject_head.clone())) {
+                        Ok(s) if cx.check(&s) => s,
+                        _ => return CONTINUE,
+                    }
+                }
+                _ => subst,
+            };
             match var {
                 Some(var) => {
                     let value = Replacement::Single(subject.clone());

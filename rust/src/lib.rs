@@ -29,7 +29,10 @@ pub use expressions::{
     make_dot_variable, make_plus_variable, make_star_variable, Arity, Expr, ExprError, ExprKind, Head, HeadBuilder,
     OperationHead, Pattern, WildcardSpec,
 };
-pub use functions::{replace, replace_all, replace_all_post_order, substitute, ReplacementRule, RewriteError};
+pub use functions::{
+    replace, replace_all, replace_all_post_order, replace_many, substitute, substitute_sorted_by, ReplacementRule,
+    RewriteError,
+};
 pub use matching::many_to_one::{ManyToOneMatcher, ManyToOneReplacer};
 pub use matching::one_to_one::{first_match, for_each_match, is_match, match_anywhere, match_pattern, MatchError};
 pub use multiset::Multiset;

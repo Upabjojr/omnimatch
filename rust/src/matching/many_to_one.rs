@@ -62,6 +62,8 @@ enum Key {
     Expr(Expr),
     /// A specific operation head.
     Operation(Head),
+    /// Any operation (patterns with a wildcard head; Python: `HeadTypeAnyOperation`).
+    AnyOperation,
     /// Matches any subject: wildcards and epsilon transitions.
     Any,
     End,
@@ -330,6 +332,7 @@ fn name_for_position(position: &[usize], variables: &[(String, String)]) -> Stri
 fn label_and_key(expression: Option<&Expr>) -> (Label, Key) {
     let Some(expression) = expression else { return (Label::Epsilon, Key::Any) };
     match expression.kind() {
+        ExprKind::Operation { head, .. } if head.wildcard => (Label::Operation(head.clone()), Key::AnyOperation),
         ExprKind::Operation { head, .. } => (Label::Operation(head.clone()), Key::Operation(head.clone())),
         ExprKind::Wildcard(w) => {
             let anonymous = Expr::wildcard(w.min_count, w.fixed_size, None, w.default.clone()).expect("valid wildcard");
@@ -559,7 +562,7 @@ impl<'a> MatchIter<'a> {
                 vec![Key::Any]
             }
             Some(subject) => match subject.head() {
-                Some(head) => vec![Key::Operation(head.clone()), Key::Any],
+                Some(head) => vec![Key::Operation(head.clone()), Key::AnyOperation, Key::Any],
                 None => vec![Key::Expr(subject.clone()), Key::Any],
             },
         };
@@ -755,6 +758,42 @@ impl<'a> MatchIter<'a> {
     fn match_regular_operation(&mut self, t: &'a Transition, k: K<'_, 'a>) -> Flow {
         let Label::Operation(head) = &t.label else { unreachable!("operation transition") };
         let subject = self.subjects.pop_front().expect("an operation subject");
+
+        // A wildcard head binds the subject's head (undone on backtracking).
+        let mut head_binding: Option<(&str, Option<Replacement>)> = None;
+        if let (true, Some(var)) = (head.wildcard, head.head_variable.as_deref()) {
+            let old = self.substitution.get(var).cloned();
+            let bound = Replacement::Head(subject.head().expect("operation subject").clone());
+            if self.substitution.try_add_variable(var, bound).is_err() {
+                self.subjects.push_front(subject);
+                return CONTINUE;
+            }
+            head_binding = Some((var, old));
+        }
+        let saved_patterns = self.patterns.clone();
+        let mut restore_constraints = Vec::new();
+        if let Some((var, _)) = head_binding {
+            self.check_constraints(ConstraintSource::Variable(var), &mut restore_constraints);
+        }
+        let flow = if self.patterns.is_empty() { CONTINUE } else { self.match_operation_operands(t, &subject, k) };
+        for index in restore_constraints {
+            self.active_constraints[index] = true;
+        }
+        self.patterns = saved_patterns;
+        if let Some((var, old)) = head_binding {
+            match old {
+                Some(value) => self.substitution.insert(var, value),
+                None => {
+                    self.substitution.remove(var);
+                }
+            }
+        }
+        self.subjects.push_front(subject);
+        flow
+    }
+
+    fn match_operation_operands(&mut self, t: &'a Transition, subject: &Expr, k: K<'_, 'a>) -> Flow {
+        let Label::Operation(head) = &t.label else { unreachable!("operation transition") };
         let operands: VecDeque<Expr> = subject.operands().iter().cloned().collect();
         let mut after: Option<VecDeque<Expr>> = Some(std::mem::replace(&mut self.subjects, operands));
         let new_associative = head.associative.then(|| head.clone());
@@ -779,7 +818,6 @@ impl<'a> MatchIter<'a> {
         });
 
         self.subjects = after.take().expect("outer subjects");
-        self.subjects.push_front(subject);
         self.associative.pop();
         flow
     }

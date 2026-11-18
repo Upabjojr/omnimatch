@@ -13,17 +13,17 @@ cargo clippy --all-targets
 
 | Python module                           | Rust                                | Status |
 |-----------------------------------------|-------------------------------------|--------|
-| `expressions/expressions.py`            | `src/expressions.rs`                | ported, except `SymbolWrapper`, `WildcardOperationHead`, `to_/from_omnimatch_expression` |
+| `expressions/expressions.py`            | `src/expressions.rs`                | ported (`WildcardOperationHead` is `Head::any`), except `SymbolWrapper` and `to_/from_omnimatch_expression` |
 | `expressions/substitution.py`           | `src/substitution.rs`               | ported |
 | `expressions/constraints.py`            | `src/constraints.rs`                | ported (`EqualVariablesConstraint`, `CustomConstraint`, `FreeOf`) |
 | `expressions/functions.py`              | methods on `Expr`, `matching/common.rs` | ported |
 | `utils.py` (combinatorics)              | `src/utils.rs`                      | ported; Python-only helpers (lambda source, cached properties, `generator_chain`) dropped |
 | `matching/_common.py`                   | `src/matching/common.rs`            | ported |
 | `matching/one_to_one.py`                | `src/matching/one_to_one.rs`        | ported |
-| `functions.py`                          | `src/functions.rs`                  | ported, except `replace_many` |
+| `functions.py`                          | `src/functions.rs`                  | ported (`sort_key` is `substitute_sorted_by`) |
 | `matching/hopcroft_karp.py`            | `src/matching/hopcroft_karp.rs`     | ported (same matchings as Python on the Python test cases) |
 | `matching/bipartite.py`                 | `src/matching/bipartite.rs`         | ported, except the graphviz helpers |
-| `matching/many_to_one.py`               | `src/matching/many_to_one.rs`       | ported (`ManyToOneMatcher`, `ManyToOneReplacer`, `CommutativeMatcher`), except `WildcardOperationHead`, graphviz helpers and the unused `SecondaryAutomaton` |
+| `matching/many_to_one.py`               | `src/matching/many_to_one.rs`       | ported (`ManyToOneMatcher`, `ManyToOneReplacer`, `CommutativeMatcher`, wildcard heads), except graphviz helpers and the unused `SecondaryAutomaton` |
 | `matching/code_generation.py`           | –                                   | not yet; may not make sense in Rust |
 | `matching/json_serialization.py`        | –                                   | not yet (would add a `serde` dependency) |
 | `_typed.py`                             | –                                   | not needed |
@@ -33,7 +33,10 @@ commutative, dot, optional, associative, star/plus/mixed sequence wildcards,
 one-identity, variable names, constraints) and `tests/test_matching_many_to_one.py`.
 As in Python's `conftest.py`, every table runs through both matchers, and
 `many_to_one_all_patterns_at_once` builds one matcher per subject holding all
-of that subject's patterns (Python: `test_many_to_one`).
+of that subject's patterns (Python: `test_many_to_one`). `tests/wildcard_head.rs`
+and `tests/functions.rs` port `test_wildcard_operation_head.py` and
+`test_functions.py` (including the logic-simplification rewrite system, run
+through both `replace_all` and `ManyToOneReplacer`).
 
 ## Design
 
@@ -98,5 +101,12 @@ of that subject's patterns (Python: `test_many_to_one`).
 * Constraint equality (used to share constraints and to detect duplicate
   patterns) goes through `Constraint::eq_key`: built-in constraints compare by
   value, `CustomConstraint`s by closure identity, other constraints by pointer.
+* Wildcard heads (`Head::any(Some("F"))`, Python: `WildcardOperationHead`) bind
+  the matched head as `Replacement::Head` (Python wraps it in a `SymbolWrapper`).
+  They work in both matchers (Python: many-to-one only), constraints on the head
+  variable are checked, and `substitute` puts a bound head back into the
+  expression. An operation with a wildcard head is not constant (Python's
+  `is_constant` overlooks wildcard heads, so e.g. `F_(a)` inside a commutative
+  pattern would be treated as a constant operand).
 * `SymbolWrapper` (wrapping host-language objects) is not ported. Atoms are
   identified by name only.

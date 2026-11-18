@@ -100,6 +100,11 @@ impl Arity {
 ///
 /// Equality and hashing ignore `infix` (it only affects printing), matching the
 /// Python implementation.
+///
+/// A *wildcard* head (Python: `WildcardOperationHead`, built with
+/// [`Head::any`]) matches an operation with any head, binding that head to
+/// `head_variable` (as [`Replacement::Head`](crate::Replacement::Head)) when
+/// one is given. A wildcard head never equals a plain head.
 #[derive(Debug, Clone)]
 pub struct OperationHead {
     pub name: String,
@@ -108,11 +113,22 @@ pub struct OperationHead {
     pub associative: bool,
     pub one_identity: bool,
     pub infix: bool,
+    pub wildcard: bool,
+    pub head_variable: Option<String>,
 }
 
 impl OperationHead {
-    fn key(&self) -> (&str, Arity, bool, bool, bool) {
-        (&self.name, self.arity, self.commutative, self.associative, self.one_identity)
+    #[allow(clippy::type_complexity)]
+    fn key(&self) -> (&str, Arity, bool, bool, bool, bool, Option<&str>) {
+        (
+            &self.name,
+            self.arity,
+            self.commutative,
+            self.associative,
+            self.one_identity,
+            self.wildcard,
+            self.head_variable.as_deref(),
+        )
     }
 }
 
@@ -183,6 +199,12 @@ impl HeadBuilder {
         self.head.infix = value;
         self
     }
+    /// Make this a wildcard head binding the matched head to `variable_name`.
+    pub fn wildcard(mut self, variable_name: Option<&str>) -> Self {
+        self.head.wildcard = true;
+        self.head.head_variable = variable_name.map(str::to_owned);
+        self
+    }
 
     /// Validate and build the head (Python: `Operation.new`).
     pub fn build(self) -> Result<Head, ExprError> {
@@ -230,8 +252,16 @@ impl Head {
                 associative: false,
                 one_identity: false,
                 infix: false,
+                wildcard: false,
+                head_variable: None,
             },
         }
+    }
+
+    /// A variadic wildcard head named `__any__`, matching any operation head
+    /// and binding it to `variable_name` (Python: `WildcardOperationHead`).
+    pub fn any(variable_name: Option<&str>) -> Head {
+        Head::builder("__any__").wildcard(variable_name).build_unchecked()
     }
 
     /// Shorthand for `Head::builder(name).arity(arity).build()`.
@@ -519,14 +549,15 @@ impl Expr {
         }
     }
 
-    /// True if no wildcard occurs anywhere (Python: `expressions.functions.is_constant`).
+    /// True if no wildcard (or wildcard head) occurs anywhere (Python:
+    /// `expressions.functions.is_constant`, which overlooks wildcard heads).
     ///
     /// Note: this ignores variable names on non-wildcards, like the Python
     /// function of the same name (the `Expression.is_constant` *property* does not).
     pub fn is_constant(&self) -> bool {
         match self.kind() {
             ExprKind::Wildcard(_) => false,
-            ExprKind::Operation { operands, .. } => operands.iter().all(Expr::is_constant),
+            ExprKind::Operation { head, operands } => !head.wildcard && operands.iter().all(Expr::is_constant),
             ExprKind::Atom { .. } => true,
         }
     }
@@ -559,12 +590,15 @@ impl Expr {
         result
     }
 
-    /// Multiset of variable names.
+    /// Multiset of variable names (including wildcard-head variables).
     pub fn variables(&self) -> Multiset<String> {
         let mut result = Multiset::new();
         self.for_each_preorder(&mut |e| {
             if let Some(v) = e.variable_name() {
                 result.add(v.to_owned());
+            }
+            if let Some(v) = e.head().and_then(|h| h.head_variable.as_ref()) {
+                result.add(v.clone());
             }
         });
         result
@@ -578,6 +612,7 @@ impl Expr {
     /// True if any variable name from `variables` occurs in the expression.
     pub fn contains_variables_from_set(&self, variables: &BTreeSet<String>) -> bool {
         self.variable_name().is_some_and(|v| variables.contains(v))
+            || self.head().and_then(|h| h.head_variable.as_ref()).is_some_and(|v| variables.contains(v))
             || self.operands().iter().any(|o| o.contains_variables_from_set(variables))
     }
 
