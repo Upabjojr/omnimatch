@@ -25,6 +25,45 @@ pub trait Constraint: fmt::Debug + Send + Sync {
 
     /// A copy of the constraint with variables renamed.
     fn with_renamed_vars(&self, renaming: &HashMap<String, String>) -> Arc<dyn Constraint>;
+
+    /// A value identifying the constraint for equality and hashing (Python:
+    /// `__eq__` / `__hash__`). `None` means "only equal to itself" (compared by
+    /// pointer), which is the right default for opaque constraints.
+    fn eq_key(&self) -> Option<String> {
+        None
+    }
+}
+
+/// An `Arc<dyn Constraint>` compared and hashed by [`Constraint::eq_key`]
+/// (falling back to pointer identity), so it can be used in sets and maps.
+#[derive(Clone, Debug)]
+pub struct ConstraintRef(pub Arc<dyn Constraint>);
+
+impl ConstraintRef {
+    fn address(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+}
+
+impl PartialEq for ConstraintRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0.eq_key(), other.0.eq_key()) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.address() == other.address(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstraintRef {}
+
+impl std::hash::Hash for ConstraintRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self.0.eq_key() {
+            Some(key) => key.hash(state),
+            None => self.address().hash(state),
+        }
+    }
 }
 
 fn rename(name: &str, renaming: &HashMap<String, String>) -> String {
@@ -69,6 +108,10 @@ impl Constraint for EqualVariablesConstraint {
 
     fn with_renamed_vars(&self, renaming: &HashMap<String, String>) -> Arc<dyn Constraint> {
         Arc::new(EqualVariablesConstraint::new(self.variables.iter().map(|v| rename(v, renaming))))
+    }
+
+    fn eq_key(&self) -> Option<String> {
+        Some(format!("EqualVariables{:?}", self.variables))
     }
 }
 
@@ -145,6 +188,11 @@ impl Constraint for CustomConstraint {
             label: self.label.clone(),
         })
     }
+
+    /// Equal iff the same closure (Python: the same callable) on the same variables.
+    fn eq_key(&self) -> Option<String> {
+        Some(format!("Custom{:p}{:?}", Arc::as_ptr(&self.predicate) as *const (), self.variables))
+    }
 }
 
 impl fmt::Debug for CustomConstraint {
@@ -218,6 +266,10 @@ impl Constraint for FreeOf {
             variables: self.variables.iter().map(|v| rename(v, renaming)).collect(),
             symbol_name: self.symbol_name.clone(),
         })
+    }
+
+    fn eq_key(&self) -> Option<String> {
+        Some(format!("FreeOf{:?}{:?}", self.variables, self.symbol_name))
     }
 }
 

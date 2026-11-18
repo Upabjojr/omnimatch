@@ -1,4 +1,4 @@
-//! Port of the one-to-one cases from `tests/test_matching.py`.
+//! Port of `tests/test_matching.py` and `tests/test_matching_many_to_one.py`.
 
 // The tables mirror the Python ones literally, `&[a.clone()]` included.
 #![allow(clippy::cloned_ref_to_slice_refs)]
@@ -119,8 +119,38 @@ fn sub(pairs: &[(&str, Replacement)]) -> Substitution {
     pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
+/// One-to-one matches. Like Python's `conftest.py`, every table also runs
+/// through the many-to-one matcher, which must find the same set of matches.
 fn matches(subject: &Expr, pattern: &Expr) -> Vec<Substitution> {
-    match_pattern(subject, &Pattern::new(pattern.clone())).unwrap()
+    let pattern = Pattern::new(pattern.clone());
+    let result = match_pattern(subject, &pattern).unwrap();
+    check_many_to_one(subject, &pattern, &result);
+    RECORDED.with(|r| {
+        if let Some(rows) = r.borrow_mut().as_mut() {
+            rows.push((subject.clone(), pattern.expression.clone(), result.clone()));
+        }
+    });
+    result
+}
+
+type Row = (Expr, Expr, Vec<Substitution>);
+
+thread_local! {
+    /// When `Some`, `matches` records every (subject, pattern, matches) row.
+    static RECORDED: std::cell::RefCell<Option<Vec<Row>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn check_many_to_one(subject: &Expr, pattern: &Pattern, expected: &[Substitution]) {
+    let matcher = ManyToOneMatcher::from_patterns([pattern.clone()]);
+    let many: Vec<Substitution> = matcher.match_all(subject).into_iter().map(|(_, s)| s).collect();
+    let as_set = |v: &[Substitution]| v.iter().map(ToString::to_string).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        as_set(&many),
+        as_set(expected),
+        "many-to-one differs for {subject} / {pattern}: one-to-one {}, many-to-one {}",
+        show(expected),
+        show(&many)
+    );
 }
 
 /// Python's check: every expected match is found and every found match is expected.
@@ -736,6 +766,15 @@ fn variable_name() {
             f2(&[fh.call_named(vec![a.clone(), b.clone()], "x")]),
             x(f(&[a.clone(), b.clone()])),
         ),
+        // Not in the Python table; Python's many-to-one matcher drops `x` here.
+        (
+            f(&[f_c(&[b.clone(), a.clone()])]),
+            f(&[head("f_c").call_named(vec![a.clone(), b.clone()], "x")]),
+            x(f_c(&[a.clone(), b.clone()])),
+        ),
+        (f(&[f_c(&[a.clone()]), a.clone()]), f(&[head("f_c").call_named(vec![x_()], "y"), x_()]), {
+            vec![sub(&[("x", one(a.clone())), ("y", one(f_c(&[a.clone()])))])]
+        }),
     ];
     for (subject, pattern, expected) in cases {
         assert_matches(subject, pattern, expected);
@@ -813,15 +852,19 @@ impl Constraint for MockConstraint {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.value
     }
-    fn with_renamed_vars(&self, _renaming: &std::collections::HashMap<String, String>) -> Arc<dyn Constraint> {
-        unimplemented!()
+    fn with_renamed_vars(&self, renaming: &std::collections::HashMap<String, String>) -> Arc<dyn Constraint> {
+        let vars: Vec<&str> = self.vars.iter().map(|v| renaming.get(v).unwrap_or(v).as_str()).collect();
+        MockConstraint::new(self.value, &vars)
     }
 }
 
 fn count_with_mocks(subject: &Expr, pattern: &Expr, values: &[bool], vars: &[&str]) -> usize {
     let constraints: Vec<Arc<dyn Constraint>> =
         values.iter().map(|&v| MockConstraint::new(v, vars) as Arc<dyn Constraint>).collect();
-    match_pattern(subject, &Pattern::with_constraints(pattern.clone(), constraints)).unwrap().len()
+    let pattern = Pattern::with_constraints(pattern.clone(), constraints);
+    let result = match_pattern(subject, &pattern).unwrap();
+    check_many_to_one(subject, &pattern, &result);
+    result.len()
 }
 
 #[test]
@@ -912,4 +955,246 @@ fn rewriting() {
     // replace splices too
     let r = replace(&f(&[a(), b()]), &[0], seq(&[c(), c()])).unwrap();
     assert_eq!(r, one(f(&[c(), c(), b()])));
+}
+
+// ─── many-to-one (tests/test_matching_many_to_one.py) ────────────────────────
+
+/// `test_many_to_one`: for every subject in the tables, one matcher holding
+/// all of that subject's patterns must yield exactly each pattern's matches.
+#[test]
+fn many_to_one_all_patterns_at_once() {
+    RECORDED.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    for table in [
+        constant_match,
+        commutative_match,
+        commutative_syntactic_match,
+        wildcard_dot_match,
+        optional_wildcard_match,
+        associative_wildcard_dot_match,
+        wildcard_star_match,
+        wildcard_plus_match,
+        wildcard_mixed_match,
+        commutative_multiple_fixed_vars,
+        commutative_multiple_sequence_vars,
+        mixed_commutative_vars,
+        mixed_associative_commutative_vars,
+        variable_name,
+        one_identity_match,
+    ] {
+        table();
+    }
+    let rows = RECORDED.with(|r| r.borrow_mut().take()).unwrap();
+    type PatternRows = Vec<(Expr, Vec<Substitution>)>;
+    let mut by_subject: Vec<(Expr, PatternRows)> = Vec::new();
+    for (subject, pattern, result) in rows {
+        let entry = match by_subject.iter_mut().find(|(s, _)| *s == subject) {
+            Some(entry) => entry,
+            None => {
+                by_subject.push((subject, Vec::new()));
+                by_subject.last_mut().unwrap()
+            }
+        };
+        if !entry.1.iter().any(|(p, _)| *p == pattern) {
+            entry.1.push((pattern, result));
+        }
+    }
+    assert!(by_subject.len() > 50, "the tables should provide many subjects");
+    for (subject, patterns) in by_subject {
+        let matcher = ManyToOneMatcher::from_patterns(patterns.iter().map(|(p, _)| Pattern::new(p.clone())));
+        let got: std::collections::BTreeSet<String> =
+            matcher.match_all(&subject).iter().map(|(p, s)| format!("{p} {s}")).collect();
+        let expected: std::collections::BTreeSet<String> =
+            patterns.iter().flat_map(|(p, ms)| ms.iter().map(move |s| format!("{p} {s}"))).collect();
+        assert_eq!(got, expected, "subject {subject}");
+    }
+}
+
+fn str_len(r: &Replacement) -> usize {
+    r.to_string().len()
+}
+
+fn custom(pred: fn(&Replacement) -> bool) -> Arc<dyn Constraint> {
+    Arc::new(CustomConstraint::new(["x"], move |args: &[&Replacement]| pred(args[0])))
+}
+
+fn matcher_of(patterns: &[Pattern]) -> ManyToOneMatcher {
+    ManyToOneMatcher::from_patterns(patterns.iter().cloned())
+}
+
+#[test]
+fn add_duplicate_pattern() {
+    let mut matcher = ManyToOneMatcher::new();
+    matcher.add(Pattern::new(f(&[a()])));
+    matcher.add(Pattern::new(f(&[a()])));
+    assert_eq!(matcher.len(), 1);
+
+    let mut matcher = ManyToOneMatcher::new();
+    matcher.add(Pattern::new(f(&[a()])));
+    matcher.add(Pattern::with_constraints(f(&[a()]), vec![MockConstraint::new(false, &[])]));
+    assert_eq!(matcher.len(), 2);
+}
+
+#[test]
+fn different_constraints() {
+    let long = custom(|x| str_len(x) > 1);
+    let short = custom(|x| str_len(x) == 1);
+    for (h1, h2) in [("f", "f"), ("f_c", "f_c")] {
+        let p1 = Pattern::with_constraints(head(h1).call(vec![x_()]), vec![long.clone()]);
+        let p2 = Pattern::with_constraints(head(h1).call(vec![x_()]), vec![short.clone()]);
+        let p3 = Pattern::with_constraints(head(h2).call(vec![x_(), b()]), vec![long.clone()]);
+        let p4 = Pattern::with_constraints(head(h2).call(vec![x_(), b()]), vec![short.clone()]);
+        let matcher = matcher_of(&[p1, p2.clone(), p3.clone(), p4.clone()]);
+
+        let result = matcher.match_all(&head(h1).call(vec![a()]));
+        assert_eq!(result.len(), 1, "{h1}");
+        assert_eq!((result[0].0, &result[0].1), (&p2, &sub(&[("x", one(a()))])));
+
+        let longer = Expr::atom("longer");
+        let result = matcher.match_all(&head(h2).call(vec![longer.clone(), b()]));
+        assert_eq!(result.len(), 1, "{h2}");
+        assert_eq!((result[0].0, &result[0].1), (&p3, &sub(&[("x", one(longer))])));
+
+        if h2 == "f_c" {
+            let result = matcher.match_all(&f_c(&[a(), b()]));
+            assert_eq!(result.len(), 1);
+            assert_eq!((result[0].0, &result[0].1), (&p4, &sub(&[("x", one(a()))])));
+        }
+    }
+}
+
+#[test]
+fn different_constraints_no_match_on_operation() {
+    let is_a = custom(|x| *x == Replacement::Single(Expr::atom("a")));
+    let is_b = custom(|x| *x == Replacement::Single(Expr::atom("b")));
+    let matcher = matcher_of(&[
+        Pattern::with_constraints(f(&[x_()]), vec![is_a]),
+        Pattern::with_constraints(f(&[x_()]), vec![is_b]),
+    ]);
+    assert!(matcher.match_all(&f(&[c()])).is_empty());
+}
+
+#[test]
+fn different_pattern_same_constraint() {
+    for c1 in [true, false] {
+        for c2 in [true, false] {
+            let constr1: Arc<dyn Constraint> = Arc::new(CustomConstraint::new(["x"], move |_: &[&Replacement]| c1));
+            let constr2: Arc<dyn Constraint> = Arc::new(CustomConstraint::new(["x"], move |_: &[&Replacement]| c2));
+            let constr3 = custom(|_| true);
+            let matcher = matcher_of(&[
+                Pattern::with_constraints(f2(&[x_(), a()]), vec![constr3.clone()]),
+                Pattern::with_constraints(f(&[a(), a(), x_()]), vec![constr3]),
+                Pattern::with_constraints(f(&[a(), x_()]), vec![constr1.clone()]),
+                Pattern::with_constraints(f(&[x_(), a()]), vec![constr2]),
+                Pattern::with_constraints(f(&[a(), x_(), b()]), vec![constr1.clone()]),
+                Pattern::with_constraints(f(&[x_(), a(), b()]), vec![constr1]),
+            ]);
+            assert_eq!(matcher.match_all(&f(&[a(), a()])).len(), c1 as usize + c2 as usize, "{c1} {c2}");
+        }
+    }
+}
+
+#[test]
+fn same_commutative_but_different_pattern() {
+    let p1 = Pattern::new(f(&[f_c(&[x_()]), a()]));
+    let p2 = Pattern::new(f(&[f_c(&[x_()]), b()]));
+    let matcher = matcher_of(&[p1.clone(), p2.clone()]);
+    let x_a = sub(&[("x", one(a()))]);
+    let result = matcher.match_all(&f(&[f_c(&[a()]), a()]));
+    assert_eq!(result, vec![(&p1, x_a.clone())]);
+    let result = matcher.match_all(&f(&[f_c(&[a()]), b()]));
+    assert_eq!(result, vec![(&p2, x_a)]);
+}
+
+#[test]
+fn grouped() {
+    let p1 = Pattern::with_constraints(a(), vec![MockConstraint::new(true, &[])]);
+    let p2 = Pattern::with_constraints(a(), vec![MockConstraint::new(true, &[])]);
+    let p3 = Pattern::with_constraints(x_(), vec![MockConstraint::new(true, &[])]);
+    let matcher = matcher_of(&[p1, p2, p3]);
+    let mut sizes = Vec::new();
+    let _ = matcher.for_each_group(&a(), &mut |group| {
+        sizes.push(group.len());
+        std::ops::ControlFlow::Continue(())
+    });
+    sizes.sort();
+    assert_eq!(sizes, vec![1, 2]);
+}
+
+#[test]
+fn labels() {
+    let show = |m: &ManyToOneMatcher<i32>| {
+        let mut r: Vec<String> = m.match_all(&a()).iter().map(|(l, s)| format!("{l} {s}")).collect();
+        r.sort();
+        r
+    };
+    let mut m = ManyToOneMatcher::new();
+    m.add_with_label(Pattern::new(a()), 42);
+    m.add_with_label(Pattern::new(a()), 23);
+    assert_eq!(show(&m), ["23 {}", "42 {}"]);
+
+    let mut m = ManyToOneMatcher::new();
+    m.add_with_label(Pattern::new(a()), 42);
+    m.add_with_label(Pattern::new(x_()), 42);
+    assert_eq!(show(&m), ["42 {x ↦ a}", "42 {}"]);
+
+    let mut m = ManyToOneMatcher::new();
+    m.add_with_label(Pattern::new(a()), 42);
+    m.add_with_label(Pattern::new(x_()), 23);
+    assert_eq!(show(&m), ["23 {x ↦ a}", "42 {}"]);
+}
+
+#[test]
+fn one_identity_optional_commutativity() {
+    let int = Head::new("Int", Arity::Binary).unwrap();
+    let add = Head::builder("+").infix(true).associative(true).commutative(true).one_identity(true).build().unwrap();
+    let mul = Head::builder("*").infix(true).associative(true).commutative(true).one_identity(true).build().unwrap();
+    let pow = Head::builder("^").arity(Arity::Binary).infix(true).build().unwrap();
+    let (i0, i1, i2) = (Expr::atom("0"), Expr::atom("1"), Expr::atom("2"));
+    let (x, wx, wa) = (Expr::atom("x"), make_dot_variable("x"), make_dot_variable("a"));
+    let opt = |name: &str, d: &Expr| Expr::optional(name, d.clone());
+    let lin = |a: Expr, b: Expr| add.call(vec![a, mul.call(vec![b, wx.clone()])]);
+    let body = |a: Expr| {
+        mul.call(vec![
+            pow.call(vec![lin(a, opt("b", &i1)), opt("m", &i1)]),
+            pow.call(vec![lin(opt("c", &i0), opt("d", &i1)), opt("n", &i1)]),
+        ])
+    };
+    let mut matcher = ManyToOneMatcher::new();
+    matcher.add_with_label(Pattern::new(int.call(vec![body(opt("a", &i0)), wx.clone()])), 22);
+    matcher.add_with_label(Pattern::new(int.call(vec![body(wa), wx.clone()])), 23);
+
+    let subject = int.call(vec![
+        mul.call(vec![
+            pow.call(vec![add.call(vec![mul.call(vec![b(), x.clone()]), a()]), i2.clone()]),
+            pow.call(vec![x.clone(), i2.clone()]),
+        ]),
+        x.clone(),
+    ]);
+    let mut result: Vec<String> = matcher.match_all(&subject).iter().map(|(l, s)| format!("{l} {s}")).collect();
+    result.sort();
+    assert_eq!(
+        result,
+        [
+            "22 {a ↦ 0, b ↦ 1, c ↦ a, d ↦ b, m ↦ 2, n ↦ 2, x ↦ x}",
+            "22 {a ↦ a, b ↦ b, c ↦ 0, d ↦ 1, m ↦ 2, n ↦ 2, x ↦ x}",
+            "23 {a ↦ a, b ↦ b, c ↦ 0, d ↦ 1, m ↦ 2, n ↦ 2, x ↦ x}",
+        ]
+    );
+}
+
+#[test]
+fn replacer() {
+    // f(x_) -> x and f2(x_, y_) -> f(y)
+    let rules = [
+        ReplacementRule::new(Pattern::new(f(&[x_()])), |s: &Substitution| s.get("x").unwrap().clone()),
+        ReplacementRule::new(Pattern::new(f2(&[x_(), y_()])), |s: &Substitution| {
+            Replacement::Single(f(&[s.get("y").unwrap().as_single().unwrap().clone()]))
+        }),
+    ];
+    let replacer = ManyToOneReplacer::new(rules.clone());
+    let expr = f2(&[f(&[f(&[a()])]), b()]);
+    assert_eq!(replacer.replace(&expr, None).unwrap(), one(b()));
+    assert_eq!(replace_all(&expr, &rules, None).unwrap(), one(b()));
+    assert_eq!(replacer.replace(&expr, Some(1)).unwrap(), one(f(&[b()])));
+    assert_eq!(replacer.replace_post_order(&expr).unwrap(), b());
 }

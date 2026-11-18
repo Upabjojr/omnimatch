@@ -24,12 +24,13 @@ pub mod multiset;
 pub mod substitution;
 pub mod utils;
 
-pub use constraints::{Constraint, CustomConstraint, EqualVariablesConstraint, FreeOf};
+pub use constraints::{Constraint, ConstraintRef, CustomConstraint, EqualVariablesConstraint, FreeOf};
 pub use expressions::{
     make_dot_variable, make_plus_variable, make_star_variable, Arity, Expr, ExprError, ExprKind, Head, HeadBuilder,
     OperationHead, Pattern, WildcardSpec,
 };
 pub use functions::{replace, replace_all, replace_all_post_order, substitute, ReplacementRule, RewriteError};
+pub use matching::many_to_one::{ManyToOneMatcher, ManyToOneReplacer};
 pub use matching::one_to_one::{first_match, for_each_match, is_match, match_anywhere, match_pattern, MatchError};
 pub use multiset::Multiset;
 pub use substitution::{Conflict, Replacement, Substitution};

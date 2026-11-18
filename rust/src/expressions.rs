@@ -794,6 +794,25 @@ impl Pattern {
     }
 }
 
+impl PartialEq for Pattern {
+    /// Same expression and the same *set* of constraints (as in Python).
+    fn eq(&self, other: &Self) -> bool {
+        use crate::constraints::ConstraintRef;
+        use std::collections::HashSet;
+        let set = |p: &Pattern| p.constraints.iter().cloned().map(ConstraintRef).collect::<HashSet<_>>();
+        self.expression == other.expression && set(self) == set(other)
+    }
+}
+
+impl Eq for Pattern {}
+
+impl Hash for Pattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Constraints are compared as a set, so only the expression is hashed.
+        self.expression.hash(state);
+    }
+}
+
 impl From<Expr> for Pattern {
     fn from(expression: Expr) -> Pattern {
         Pattern::new(expression)

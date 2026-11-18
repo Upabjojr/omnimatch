@@ -23,14 +23,17 @@ cargo clippy --all-targets
 | `functions.py`                          | `src/functions.rs`                  | ported, except `replace_many` |
 | `matching/hopcroft_karp.py`            | `src/matching/hopcroft_karp.rs`     | ported (same matchings as Python on the Python test cases) |
 | `matching/bipartite.py`                 | `src/matching/bipartite.rs`         | ported, except the graphviz helpers |
-| `matching/many_to_one.py`               | –                                   | not yet (the biggest piece, ~1600 lines) |
+| `matching/many_to_one.py`               | `src/matching/many_to_one.rs`       | ported (`ManyToOneMatcher`, `ManyToOneReplacer`, `CommutativeMatcher`), except `WildcardOperationHead`, graphviz helpers and the unused `SecondaryAutomaton` |
 | `matching/code_generation.py`           | –                                   | not yet; may not make sense in Rust |
 | `matching/json_serialization.py`        | –                                   | not yet (would add a `serde` dependency) |
 | `_typed.py`                             | –                                   | not needed |
 
-`tests/one_to_one.rs` ports the one-to-one tables from `tests/test_matching.py`
-(constant, commutative, dot, optional, associative, star/plus/mixed sequence
-wildcards, one-identity, variable names, constraints).
+`tests/matching.rs` ports the tables from `tests/test_matching.py` (constant,
+commutative, dot, optional, associative, star/plus/mixed sequence wildcards,
+one-identity, variable names, constraints) and `tests/test_matching_many_to_one.py`.
+As in Python's `conftest.py`, every table runs through both matchers, and
+`many_to_one_all_patterns_at_once` builds one matcher per subject holding all
+of that subject's patterns (Python: `test_many_to_one`).
 
 ## Design
 
@@ -79,5 +82,21 @@ wildcards, one-identity, variable names, constraints).
   force on every graph with up to 4 + 4 vertices.
 * `BipartiteGraph` keeps its edges in sorted order (Python: insertion order), so
   enumeration order can differ.
+* `ManyToOneMatcher<T>` is generic over the label type; `add` labels a pattern
+  with itself, `add_with_label` takes any label. Matches are delivered through
+  a callback (`for_each_match`, `for_each_group`) or collected (`match_all`,
+  `first_match`, `is_match`).
+* The many-to-one matcher binds the variable of a named commutative
+  subexpression. Python's `ManyToOneMatcher` drops it: for the pattern
+  `f(f_c(a, b, variable_name='y'))` and subject `f(f_c(a, b))` its one-to-one
+  `match` gives `{y ↦ f_c(a, b)}` but the many-to-one matcher gives `{}`
+  (`_match_transition` never runs `_check_transition` for a commutative
+  operation's own transition).
+* A `CommutativeMatcher` computes all matches of an operation's operands
+  before handing them on (Python produces them lazily). The matches are the
+  same; stopping early just saves less work.
+* Constraint equality (used to share constraints and to detect duplicate
+  patterns) goes through `Constraint::eq_key`: built-in constraints compare by
+  value, `CustomConstraint`s by closure identity, other constraints by pointer.
 * `SymbolWrapper` (wrapping host-language objects) is not ported. Atoms are
   identified by name only.
