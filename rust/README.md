@@ -5,9 +5,13 @@ directory. It has no dependencies (the Python `multiset` package is replaced by
 `src/multiset.rs`).
 
 ```
-cargo test      # unit tests, ported one-to-one matching tests, doctests
+cargo test      # unit tests, ported Python tests, doctests
 cargo clippy --all-targets
 ```
+
+CI (`.github/workflows/rust.yml`) runs `cargo fmt --check`, clippy with
+warnings as errors and the tests on stable, and builds the library with the
+minimum supported Rust version (1.70).
 
 ## Status
 
