@@ -80,29 +80,14 @@ and hypothesis tests became exhaustive loops over small ranges.
   removes them and restores them on backtracking). Every constraint whose
   variables are all bound is checked at each binding point. The matches are the
   same; a constraint may just be evaluated more often.
-* `FreeOf` also checks multiset-valued bindings. The Python `_is_free` only looks
-  inside tuples and lists, so it accepts any multiset (looks like a bug there).
 * Unnamed star wildcards in `one_identity` patterns are not bound under a
   `None` key, which the Python version does.
-* `enum_maximum_matchings` also handles maximum matchings that leave a *right*
-  vertex free. The Python `_enum_maximum_matchings_iter` (Step 8) only looks for
-  alternating paths ending at a free left vertex, so for the graph
-  `{(0, 0), (0, 1)}` it yields `{0: 0}` but never `{0: 1}`. `many_to_one` is
-  not affected: it puts patterns on the right and requires them all to be
-  matched. The Rust tests check the enumeration exhaustively against brute
-  force on every graph with up to 4 + 4 vertices.
 * `BipartiteGraph` keeps its edges in sorted order (Python: insertion order), so
   enumeration order can differ.
 * `ManyToOneMatcher<T>` is generic over the label type; `add` labels a pattern
   with itself, `add_with_label` takes any label. Matches are delivered through
   a callback (`for_each_match`, `for_each_group`) or collected (`match_all`,
   `first_match`, `is_match`).
-* The many-to-one matcher binds the variable of a named commutative
-  subexpression. Python's `ManyToOneMatcher` drops it: for the pattern
-  `f(f_c(a, b, variable_name='y'))` and subject `f(f_c(a, b))` its one-to-one
-  `match` gives `{y ↦ f_c(a, b)}` but the many-to-one matcher gives `{}`
-  (`_match_transition` never runs `_check_transition` for a commutative
-  operation's own transition).
 * A `CommutativeMatcher` computes all matches of an operation's operands
   before handing them on (Python produces them lazily). The matches are the
   same; stopping early just saves less work.
@@ -113,8 +98,23 @@ and hypothesis tests became exhaustive loops over small ranges.
   the matched head as `Replacement::Head` (Python wraps it in a `SymbolWrapper`).
   They work in both matchers (Python: many-to-one only), constraints on the head
   variable are checked, and `substitute` puts a bound head back into the
-  expression. An operation with a wildcard head is not constant (Python's
-  `is_constant` overlooks wildcard heads, so e.g. `F_(a)` inside a commutative
-  pattern would be treated as a constant operand).
+  expression.
 * `SymbolWrapper` (wrapping host-language objects) is not ported. Atoms are
   identified by name only.
+
+## Python bugs found by the port
+
+Porting turned up four bugs in the Python package. All four are fixed there
+(commit `717de02`), with regression tests on both sides:
+
+* `enum_maximum_matchings_iter` never produced maximum matchings that leave a
+  *right* vertex free (for the graph `{(0, 0), (0, 1)}` it yielded `{0: 0}` but
+  not `{0: 1}`). The Rust tests compare the enumeration against brute force on
+  every graph with up to 4 + 4 vertices.
+* `ManyToOneMatcher` dropped the variable of a named commutative
+  subexpression: `f(f_c(a, b, variable_name='y'))` matched `f(f_c(a, b))` with
+  `{}` instead of `{y ↦ f_c(a, b)}`.
+* `FreeOf` did not look inside multiset-valued bindings, so it accepted any of
+  them.
+* `is_constant` overlooked wildcard operation heads, so e.g. `F_(a)` counted as
+  a constant operand of a commutative pattern.
