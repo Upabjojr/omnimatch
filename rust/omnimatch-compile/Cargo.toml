@@ -1,0 +1,13 @@
+[package]
+name = "omnimatch-compile"
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.70"
+description = "Compile omnimatch many-to-one matchers to Rust code at build time"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+omnimatch = { path = "..", version = "0.0.3" }
+proc-macro2 = { version = "1", default-features = false }
+quote = { version = "1", default-features = false }

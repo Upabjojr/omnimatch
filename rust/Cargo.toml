@@ -10,3 +10,6 @@ readme = "README.md"
 [dependencies]
 
 [dev-dependencies]
+
+[workspace]
+members = ["omnimatch-compile", "compile-tests"]

@@ -16,6 +16,7 @@
 //! See `README.md` in the crate directory for which parts of the Python
 //! package have been ported.
 
+pub mod compiled;
 pub mod constraints;
 pub mod expressions;
 pub mod functions;

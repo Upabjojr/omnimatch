@@ -32,6 +32,19 @@ pub trait Constraint: fmt::Debug + Send + Sync {
     fn eq_key(&self) -> Option<String> {
         None
     }
+
+    /// A Rust expression (of a type implementing `Constraint`) that rebuilds
+    /// this constraint, used by matchers compiled with `omnimatch-compile`.
+    /// `None` (the default) means the constraint cannot be compiled.
+    fn rust_source(&self) -> Option<String> {
+        None
+    }
+}
+
+/// `["a", "b"]` as Rust source.
+fn rust_str_array<'a>(items: impl IntoIterator<Item = &'a String>) -> String {
+    let items: Vec<String> = items.into_iter().map(|s| format!("{s:?}")).collect();
+    format!("[{}] as [&str; {}]", items.join(", "), items.len())
 }
 
 /// An `Arc<dyn Constraint>` compared and hashed by [`Constraint::eq_key`]
@@ -113,6 +126,10 @@ impl Constraint for EqualVariablesConstraint {
     fn eq_key(&self) -> Option<String> {
         Some(format!("EqualVariables{:?}", self.variables))
     }
+
+    fn rust_source(&self) -> Option<String> {
+        Some(format!("::omnimatch::EqualVariablesConstraint::new({})", rust_str_array(&self.variables)))
+    }
 }
 
 impl fmt::Display for EqualVariablesConstraint {
@@ -142,6 +159,8 @@ pub struct CustomConstraint {
     variables: Vec<String>,
     predicate: Arc<Predicate>,
     label: Option<String>,
+    /// Path of a `fn(&[&Replacement]) -> bool` equivalent to the predicate, for compiled matchers.
+    rust_path: Option<String>,
 }
 
 impl CustomConstraint {
@@ -155,7 +174,26 @@ impl CustomConstraint {
             variables: variables.into_iter().map(Into::into).collect(),
             predicate: Arc::new(predicate),
             label: None,
+            rust_path: None,
         }
+    }
+
+    /// Name a function equivalent to the predicate, so that matchers using
+    /// this constraint can be compiled with `omnimatch-compile`: the compiled
+    /// matcher calls the function at `path` (e.g. `"crate::rules::is_positive"`,
+    /// resolved where the generated code is included), which must have the
+    /// signature `fn(&[&Replacement]) -> bool`.
+    ///
+    /// ```
+    /// use omnimatch::{CustomConstraint, Replacement};
+    /// fn distinct(args: &[&Replacement]) -> bool {
+    ///     args[0] != args[1]
+    /// }
+    /// let c = CustomConstraint::new(["x", "y"], distinct).with_rust_path("crate::distinct");
+    /// ```
+    pub fn with_rust_path(mut self, path: impl Into<String>) -> Self {
+        self.rust_path = Some(path.into());
+        self
     }
 
     /// Attach a human-readable label, used by `Debug` (Python shows the lambda source).
@@ -186,12 +224,25 @@ impl Constraint for CustomConstraint {
             variables: self.variables.iter().map(|v| rename(v, renaming)).collect(),
             predicate: self.predicate.clone(),
             label: self.label.clone(),
+            rust_path: self.rust_path.clone(),
         })
     }
 
     /// Equal iff the same closure (Python: the same callable) on the same variables.
     fn eq_key(&self) -> Option<String> {
         Some(format!("Custom{:p}{:?}", Arc::as_ptr(&self.predicate) as *const (), self.variables))
+    }
+
+    fn rust_source(&self) -> Option<String> {
+        let path = self.rust_path.as_ref()?;
+        let mut source = format!(
+            "::omnimatch::CustomConstraint::new({}, {path}).with_rust_path({path:?})",
+            rust_str_array(&self.variables)
+        );
+        if let Some(label) = &self.label {
+            source.push_str(&format!(".with_label({label:?})"));
+        }
+        Some(source)
     }
 }
 
@@ -270,6 +321,10 @@ impl Constraint for FreeOf {
 
     fn eq_key(&self) -> Option<String> {
         Some(format!("FreeOf{:?}{:?}", self.variables, self.symbol_name))
+    }
+
+    fn rust_source(&self) -> Option<String> {
+        Some(format!("::omnimatch::FreeOf::new({}, {:?})", rust_str_array(&self.variables), self.symbol_name))
     }
 }
 

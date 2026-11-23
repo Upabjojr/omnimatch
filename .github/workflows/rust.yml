@@ -34,18 +34,18 @@ jobs:
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
-        run: cargo test
+        run: cargo test --workspace
 
   msrv:
-    name: MSRV (Rust 1.70, library build)
+    name: MSRV (Rust 1.70, tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Install toolchain
         run: rustup toolchain install 1.70 --profile minimal && rustup default 1.70
-      - name: Build library
-        run: cargo build --lib
+      - name: Tests
+        run: cargo test --workspace --locked

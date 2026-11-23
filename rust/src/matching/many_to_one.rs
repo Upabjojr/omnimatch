@@ -6,20 +6,19 @@
 //! a pattern's nodes (operation heads, atoms, wildcards, and an "end of
 //! operands" marker). Patterns sharing a prefix share states. The operands of
 //! commutative operations cannot be matched in order; each state reached by a
-//! commutative operation owns a [`CommutativeMatcher`], with its own automaton
+//! commutative operation owns a `CommutativeMatcher`, with its own automaton
 //! for the operands, which matches the operands individually and then
 //! combines them through maximum bipartite matchings.
 //!
-//! Matching is a backtracking search that mutates one [`MatchIter`] (remaining
+//! Matching is a backtracking search that mutates one `MatchIter` (remaining
 //! subjects, still-viable patterns, the substitution, ...) and undoes each
 //! change when it backtracks, like the Python version. Python's generators
 //! become continuation-passing: each step calls `k` for every state reached and
 //! stops early if `k` returns [`ControlFlow::Break`].
 //!
 //! Differences from Python:
-//! * `WildcardOperationHead` patterns (`HeadTypeAnyOperation`) are not ported yet.
 //! * The graphviz helpers and `SecondaryAutomaton` (unused) are not ported.
-//! * Results of a [`CommutativeMatcher`] are collected before being consumed
+//! * Results of a `CommutativeMatcher` are collected before being consumed
 //!   rather than produced lazily, so an early stop still pays for all the
 //!   matches of the innermost commutative operation.
 
@@ -914,37 +913,51 @@ struct Cache {
 /// Matches the operands of one commutative operation (Python: `CommutativeMatcher`).
 #[derive(Debug)]
 struct CommutativeMatcher {
-    patterns: Vec<PatternValue>,
+    core: CommutativeCore,
     pattern_index: HashMap<PatternKey, usize>,
+    /// Matches a single operand against the operand patterns.
     automaton: Automaton,
+}
+
+/// The part of a commutative matcher that combines operand matches through
+/// bipartite matchings. It does not know how single operands are matched:
+/// the interpreted [`ManyToOneMatcher`] runs an operand automaton, a compiled
+/// matcher (see [`crate::compiled`]) calls generated code.
+#[derive(Debug)]
+pub struct CommutativeCore {
+    patterns: Vec<PatternValue>,
     associative: Option<Head>,
     max_optional_count: usize,
     anonymous_patterns: BTreeSet<usize>,
     cache: RefCell<Cache>,
 }
 
+/// A commutative pattern: its operand pattern ids as `(id, count)` pairs,
+/// and its sequence variables with whether their values are wrapped in the
+/// associative head.
+pub type CommutativePatternSpec = (Vec<(usize, usize)>, Vec<(VariableWithCount, bool)>);
+
+/// Matches of one operand (`None`: the optional slot): `(operand pattern, substitution)` pairs.
+pub type OperandMatches<'f> = &'f dyn Fn(Option<&Expr>) -> Vec<(usize, Substitution)>;
+
 type Edge = ((i64, usize), (usize, usize));
 
 impl CommutativeMatcher {
     fn new(associative: Option<Head>) -> Self {
         CommutativeMatcher {
-            patterns: Vec::new(),
+            core: CommutativeCore::new(associative, 0, [], Vec::new()),
             pattern_index: HashMap::new(),
             automaton: Automaton::new(),
-            associative,
-            max_optional_count: 0,
-            anonymous_patterns: BTreeSet::new(),
-            cache: RefCell::new(Cache::default()),
         }
     }
 
     fn clear(&self) {
-        *self.cache.borrow_mut() = Cache::default();
+        self.core.clear();
         self.automaton.clear_caches();
     }
 
     fn is_sequence_wildcard(&self, expression: &Expr) -> bool {
-        expression.as_wildcard().is_some_and(|w| !w.fixed_size || self.associative.is_some())
+        expression.as_wildcard().is_some_and(|w| !w.fixed_size || self.core.associative.is_some())
     }
 
     fn add_pattern(&mut self, operands: &[Expr], constraints: &[Arc<dyn Constraint>]) -> usize {
@@ -970,7 +983,7 @@ impl CommutativeMatcher {
                         let anonymous = operand.is_anonymous();
                         let index = self.automaton.internal_add(pattern, renaming);
                         if anonymous {
-                            self.anonymous_patterns.insert(index);
+                            self.core.anonymous_patterns.insert(index);
                         }
                         index
                     }
@@ -989,7 +1002,7 @@ impl CommutativeMatcher {
                 Some(n) => {
                     let (count, wrap) = match existing {
                         Some(i) => (pattern_vars[i].1 .0.count, pattern_vars[i].1 .1),
-                        None => (0, w.fixed_size && self.associative.is_some()),
+                        None => (0, w.fixed_size && self.core.associative.is_some()),
                     };
                     (VariableWithCount::new(Some(n), count + 1, w.min_count, w.default.clone()), wrap)
                 }
@@ -999,7 +1012,7 @@ impl CommutativeMatcher {
                 None => pattern_vars.push((name, entry)),
             }
         }
-        self.max_optional_count = self.max_optional_count.max(opt_count);
+        self.core.max_optional_count = self.core.max_optional_count.max(opt_count);
 
         let mut sorted_vars: Vec<(VariableWithCount, bool)> = pattern_vars.into_iter().map(|(_, v)| v).collect();
         sorted_vars.sort_by(|(a, wa), (b, wb)| {
@@ -1014,15 +1027,15 @@ impl CommutativeMatcher {
         if let Some(&index) = self.pattern_index.get(&key) {
             return index;
         }
-        let index = self.patterns.len();
+        let index = self.core.patterns.len();
         self.pattern_index.insert(key, index);
-        self.patterns.push(PatternValue { index, pattern_set, variables: sorted_vars });
+        self.core.patterns.push(PatternValue { index, pattern_set, variables: sorted_vars });
         index
     }
 
     /// All `(operand pattern, substitution)` matches of the operand automaton.
     fn operand_matches(&self, subject: Option<&Expr>) -> Vec<(usize, Substitution)> {
-        let mut it = MatchIter::new(&self.automaton, subject.cloned(), self.associative.clone());
+        let mut it = MatchIter::new(&self.automaton, subject.cloned(), self.core.associative.clone());
         let mut out = Vec::new();
         let _ = it.match_state(ROOT, &mut |it, _| {
             for &index in &it.patterns {
@@ -1033,13 +1046,62 @@ impl CommutativeMatcher {
         out
     }
 
+    fn add_subject(&self, subject: Option<&Expr>) -> i64 {
+        self.core.add_subject(subject, &|s| self.operand_matches(s))
+    }
+
+    fn match_operands(&self, subjects: &[Expr], substitution: &Substitution) -> Vec<(usize, Substitution)> {
+        self.core.match_operands(subjects, substitution)
+    }
+}
+
+impl CommutativeCore {
+    /// A core for the given commutative patterns: each is a multiset of
+    /// operand pattern ids (as `(id, count)` pairs) plus its sequence
+    /// variables, and whether their values are wrapped in the associative head.
+    pub fn new(
+        associative: Option<Head>,
+        max_optional_count: usize,
+        anonymous_patterns: impl IntoIterator<Item = usize>,
+        patterns: Vec<CommutativePatternSpec>,
+    ) -> Self {
+        let patterns = patterns
+            .into_iter()
+            .enumerate()
+            .map(|(index, (set, variables))| {
+                let mut pattern_set = Multiset::new();
+                for (id, count) in set {
+                    pattern_set.add_n(id, count);
+                }
+                PatternValue { index, pattern_set, variables }
+            })
+            .collect();
+        CommutativeCore {
+            patterns,
+            associative,
+            max_optional_count,
+            anonymous_patterns: anonymous_patterns.into_iter().collect(),
+            cache: RefCell::new(Cache::default()),
+        }
+    }
+
+    /// Forget the operands seen so far.
+    pub fn clear(&self) {
+        *self.cache.borrow_mut() = Cache::default();
+    }
+
+    /// The associative head the operands' sequence variables are wrapped in.
+    pub fn associative(&self) -> Option<&Head> {
+        self.associative.as_ref()
+    }
+
     /// Register a subject operand (`None`: the optional slot) and match it
     /// against the operand patterns, unless that was done before.
-    fn add_subject(&self, subject: Option<&Expr>) -> i64 {
+    pub fn add_subject(&self, subject: Option<&Expr>, operand_matches: OperandMatches<'_>) -> i64 {
         match subject {
             None => {
                 if !self.cache.borrow().optional_initialized {
-                    let matches = self.operand_matches(None);
+                    let matches = operand_matches(None);
                     let mut cache = self.cache.borrow_mut();
                     cache.optional_initialized = true;
                     for (pattern_index, subst) in matches {
@@ -1053,7 +1115,7 @@ impl CommutativeMatcher {
                 if let Some((id, _)) = self.cache.borrow().subjects.get(subject) {
                     return *id;
                 }
-                let matches = self.operand_matches(Some(subject));
+                let matches = operand_matches(Some(subject));
                 let mut cache = self.cache.borrow_mut();
                 let id = cache.subjects_by_id.len() as i64;
                 cache.subjects_by_id.push(subject.clone());
@@ -1070,7 +1132,7 @@ impl CommutativeMatcher {
 
     /// All `(commutative pattern id, substitution)` matches for the operands
     /// `subjects` (which must all have been registered with `add_subject`).
-    fn match_operands(&self, subjects: &[Expr], substitution: &Substitution) -> Vec<(usize, Substitution)> {
+    pub fn match_operands(&self, subjects: &[Expr], substitution: &Substitution) -> Vec<(usize, Substitution)> {
         let cache = self.cache.borrow();
         let mut subject_ids: Multiset<i64> = Multiset::new();
         let mut pattern_ids: Multiset<usize> = Multiset::new();
@@ -1345,5 +1407,84 @@ impl ManyToOneReplacer {
                 None => return Ok((expression, any_replaced)),
             }
         }
+    }
+}
+
+// ─── export (for compiled matchers) ──────────────────────────────────────────
+
+impl<T> ManyToOneMatcher<T> {
+    /// A snapshot of the matcher's automaton, for `omnimatch-compile`.
+    pub fn export(&self) -> crate::compiled::AutomatonInfo {
+        export_automaton(&self.automaton)
+    }
+}
+
+fn export_automaton(a: &Automaton) -> crate::compiled::AutomatonInfo {
+    use crate::compiled::{AutomatonInfo, CommutativeInfo, KeyInfo, LabelInfo, PatternInfo, StateInfo, TransitionInfo};
+    let key_info = |key: &Key| match key {
+        Key::Expr(e) => KeyInfo::Atom(e.clone()),
+        Key::Operation(h) => KeyInfo::Operation(h.clone()),
+        Key::AnyOperation => KeyInfo::AnyOperation,
+        Key::Any => KeyInfo::Any,
+        Key::End => KeyInfo::End,
+        Key::PatternId(i) => KeyInfo::PatternId(*i),
+    };
+    let states = a
+        .states
+        .iter()
+        .map(|state| {
+            let mut transitions: Vec<(KeyInfo, Vec<TransitionInfo>)> = state
+                .transitions
+                .iter()
+                .map(|(key, ts)| {
+                    let ts = ts
+                        .iter()
+                        .map(|t| TransitionInfo {
+                            label: match &t.label {
+                                Label::Expr(e) => LabelInfo::Expr(e.clone()),
+                                Label::Operation(h) => LabelInfo::Operation(h.clone()),
+                                Label::Epsilon => LabelInfo::Epsilon,
+                                Label::End => LabelInfo::End,
+                            },
+                            target: t.target,
+                            variable_name: t.variable_name.clone(),
+                            patterns: t.patterns.clone(),
+                            check_constraints: t.check_constraints.clone(),
+                            subst: t.subst.clone(),
+                        })
+                        .collect();
+                    (key_info(key), ts)
+                })
+                .collect();
+            transitions.sort_by(|x, y| x.0.cmp(&y.0));
+            let commutative = state.matcher.as_deref().map(|m| CommutativeInfo {
+                associative: m.core.associative.clone(),
+                max_optional_count: m.core.max_optional_count,
+                anonymous_patterns: m.core.anonymous_patterns.clone(),
+                patterns: m
+                    .core
+                    .patterns
+                    .iter()
+                    .map(|pv| (pv.pattern_set.items().map(|(&i, &n)| (i, n)).collect(), pv.variables.clone()))
+                    .collect(),
+                automaton: Box::new(export_automaton(&m.automaton)),
+            });
+            StateInfo { transitions, commutative }
+        })
+        .collect();
+    AutomatonInfo {
+        states,
+        finals: a.finals.iter().copied().collect(),
+        patterns: a
+            .patterns
+            .iter()
+            .zip(&a.pattern_vars)
+            .map(|((pattern, _), renaming)| PatternInfo {
+                pattern: pattern.clone(),
+                renaming: renaming.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            })
+            .collect(),
+        constraints: a.constraints.clone(),
+        constraint_vars: a.constraint_vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
 }

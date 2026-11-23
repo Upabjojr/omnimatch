@@ -1,17 +1,23 @@
 # omnimatch (Rust port)
 
-A work-in-progress Rust port of the `omnimatch` Python package in the parent
-directory. It has no dependencies (the Python `multiset` package is replaced by
-`src/multiset.rs`).
+A Rust port of the `omnimatch` Python package in the parent directory. The
+workspace has three crates:
+
+* `omnimatch` (this directory): the library. It has no dependencies; the Python
+  `multiset` package is replaced by `src/multiset.rs`.
+* `omnimatch-compile/`: compiles a many-to-one matcher into Rust code at build
+  time (replacing Python's `code_generation.py`; see its README).
+* `compile-tests/`: tests and a benchmark for compiled matchers (not published).
 
 ```
-cargo test      # unit tests, ported Python tests, doctests
-cargo clippy --all-targets
+cargo test --workspace      # unit tests, ported Python tests, doctests, compiled matchers
+cargo clippy --workspace --all-targets
 ```
 
 CI (`.github/workflows/rust.yml`) runs `cargo fmt --check`, clippy with
-warnings as errors and the tests on stable, and builds the library with the
-minimum supported Rust version (1.70).
+warnings as errors and the tests on stable. It also runs the tests with the
+minimum supported Rust version (1.70), using the committed `Cargo.lock`, which
+pins `proc-macro2` and `quote` to releases that still support 1.70.
 
 ## Status
 
@@ -28,7 +34,7 @@ minimum supported Rust version (1.70).
 | `matching/hopcroft_karp.py`            | `src/matching/hopcroft_karp.rs`     | ported (same matchings as Python on the Python test cases) |
 | `matching/bipartite.py`                 | `src/matching/bipartite.rs`         | ported, except the graphviz helpers |
 | `matching/many_to_one.py`               | `src/matching/many_to_one.rs`       | ported (`ManyToOneMatcher`, `ManyToOneReplacer`, `CommutativeMatcher`, wildcard heads), except graphviz helpers and the unused `SecondaryAutomaton` |
-| `matching/code_generation.py`           | –                                   | not yet; may not make sense in Rust |
+| `matching/code_generation.py`           | `omnimatch-compile/`, `src/compiled.rs` | replaced: emits Rust tokens for rustc instead of Python source |
 | `matching/json_serialization.py`        | –                                   | not yet (would add a `serde` dependency) |
 | `_typed.py`                             | –                                   | not needed |
 
@@ -70,6 +76,16 @@ and hypothesis tests became exhaustive loops over small ranges.
 * **Errors.** Python's `ValueError`/`IndexError` become `Result`s
   (`ExprError`, `MatchError`, `RewriteError`). `Head::call` and
   `Expr::operation` are panicking shorthands for when the arity is known to be right.
+
+* **Compiled matchers.** `ManyToOneMatcher::export` exposes the automaton.
+  `omnimatch-compile` turns each state into a function whose dispatch is a
+  `match` on head and atom names, with pattern sets as constant bitsets. The
+  transitions' work (binding and backtracking, constraints, sequences, and
+  bipartite matching for commutative operations) is in `src/compiled.rs` and
+  shared with the generated code; the bipartite part is the same
+  `CommutativeCore` the interpreted matcher uses. Constraints are rebuilt in
+  the generated code from `Constraint::rust_source`, so a `CustomConstraint`
+  needs `with_rust_path`.
 
 ## Differences from the Python package
 

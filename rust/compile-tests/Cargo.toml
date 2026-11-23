@@ -1,0 +1,13 @@
+[package]
+name = "omnimatch-compile-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Tests for omnimatch-compile: compiled matchers against the interpreted ones"
+
+[dependencies]
+omnimatch = { path = ".." }
+
+[build-dependencies]
+omnimatch = { path = ".." }
+omnimatch-compile = { path = "../omnimatch-compile" }
