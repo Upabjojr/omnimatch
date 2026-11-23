@@ -79,8 +79,12 @@ and hypothesis tests became exhaustive loops over small ranges.
 
 * **Compiled matchers.** `ManyToOneMatcher::export` exposes the automaton.
   `omnimatch-compile` turns each state into a function whose dispatch is a
-  `match` on head and atom names, with pattern sets as constant bitsets. The
-  transitions' work (binding and backtracking, constraints, sequences, and
+  `match` on head and atom names. All other data (pattern sets as sorted
+  index lists, bindings, expressions, constraints, commutative patterns) goes
+  into `static` tables of integers without pointers, so the rules stay in the
+  binary's read-only data instead of on the heap; expressions, constraints
+  and commutative matchers are built from them the first time they are used.
+  The transitions' work (binding and backtracking, constraints, sequences, and
   bipartite matching for commutative operations) is in `src/compiled.rs` and
   shared with the generated code; the bipartite part is the same
   `CommutativeCore` the interpreted matcher uses. Constraints are rebuilt in

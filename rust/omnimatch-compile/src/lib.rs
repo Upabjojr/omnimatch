@@ -4,10 +4,13 @@
 //! printing source text, the compiler turns the automaton of a
 //! [`ManyToOneMatcher`] into Rust tokens: one
 //! function per state, whose dispatch on the next subject is a `match` on head
-//! and atom names, with pattern sets as constant bitsets. rustc (and LLVM)
-//! compile and optimize it together with the [`omnimatch::compiled`] runtime,
-//! which does the variable binding, backtracking and commutative (bipartite)
-//! matching shared by all matchers.
+//! and atom names. All other data (pattern sets, bindings, expressions,
+//! constraints) becomes `static` tables of integers, so a compiled matcher
+//! holds its rules in the binary's read-only data instead of on the heap.
+//! The few values that must be objects are built from those tables the first
+//! time they are used. rustc (and LLVM) compile the code together with the
+//! [`omnimatch::compiled`] runtime, which does the variable binding,
+//! backtracking and commutative (bipartite) matching shared by all matchers.
 //!
 //! Use it from a build script, then include the generated file:
 //!
@@ -42,15 +45,17 @@
 //! needs a named function, given with
 //! [`CustomConstraint::with_rust_path`](omnimatch::CustomConstraint::with_rust_path).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
-use omnimatch::compiled::{AutomatonInfo, KeyInfo, LabelInfo, TransitionInfo};
-use omnimatch::utils::VariableWithCount;
-use omnimatch::{Arity, Constraint, Expr, ExprKind, Head, ManyToOneMatcher, Pattern, Replacement, Substitution};
-use proc_macro2::{Ident, Literal, Span, TokenStream};
-use quote::{format_ident, quote};
+use omnimatch::compiled::{
+    arity_code, AutomatonInfo, CommutativeInfo, KeyInfo, LabelInfo, Span, TransitionInfo, HEAD_ASSOCIATIVE,
+    HEAD_COMMUTATIVE, HEAD_INFIX, HEAD_ONE_IDENTITY, HEAD_WILDCARD, NONE,
+};
+use omnimatch::{Constraint, Expr, ExprKind, Head, ManyToOneMatcher, Pattern, Replacement, Substitution};
+use proc_macro2::{Ident, Literal, TokenStream};
+use quote::{format_ident, quote, ToTokens};
 
 /// Why a matcher could not be compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +149,7 @@ fn syn_ident(name: &str) -> Result<Ident, CompileError> {
     if !ok || name == "_" {
         return Err(CompileError::InvalidName(name.to_owned()));
     }
-    Ok(Ident::new(name, Span::call_site()))
+    Ok(Ident::new(name, proc_macro2::Span::call_site()))
 }
 
 fn snake_case(name: &str) -> String {
@@ -173,63 +178,236 @@ struct Unit {
 }
 
 struct Core {
-    /// The automaton and state it belongs to.
-    owner: (usize, usize),
     operands: usize,
-    info: omnimatch::compiled::CommutativeInfo,
+    info: CommutativeInfo,
+    /// Per commutative pattern id, the union of its transitions' pattern sets (in `spans`).
+    pid_sets: Span,
 }
+
+fn lit(x: impl TryInto<u32> + Copy + fmt::Debug) -> Literal {
+    Literal::u32_unsuffixed(x.try_into().unwrap_or_else(|_| panic!("{x:?} does not fit in u32")))
+}
+
+fn span_tokens(s: Span) -> TokenStream {
+    let (off, len) = (lit(s.off), lit(s.len));
+    quote!(rt::Span { off: #off, len: #len })
+}
+
+/// The static tables, as they are filled.
+#[derive(Default)]
+struct Tables {
+    text: String,
+    strings: Vec<Span>,
+    string_index: HashMap<String, u32>,
+    u32s: Vec<u32>,
+    list_index: HashMap<Vec<u32>, Span>,
+    spans: Vec<Span>,
+    heads: Vec<TokenStream>,
+    head_index: HashMap<Head, u32>,
+    exprs: Vec<TokenStream>,
+    expr_index: HashMap<Expr, u32>,
+    replacements: Vec<TokenStream>,
+    substs: Vec<Span>,
+    constraints: Vec<TokenStream>,
+    constraint_index: HashMap<String, u32>,
+    automata: Vec<TokenStream>,
+    tails: Vec<TokenStream>,
+    cores: Vec<TokenStream>,
+    core_patterns: Vec<TokenStream>,
+    variables: Vec<TokenStream>,
+    transitions: Vec<TokenStream>,
+}
+
+impl Tables {
+    fn string(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.string_index.get(s) {
+            return i;
+        }
+        let i = self.strings.len() as u32;
+        self.strings.push(Span::new(self.text.len() as u32, s.len() as u32));
+        self.text.push_str(s);
+        self.string_index.insert(s.to_owned(), i);
+        i
+    }
+
+    fn opt_string(&mut self, s: Option<&str>) -> u32 {
+        s.map_or(NONE, |s| self.string(s))
+    }
+
+    /// A list in `u32s` (identical lists are shared).
+    fn list(&mut self, items: Vec<u32>) -> Span {
+        if items.is_empty() {
+            return Span::EMPTY;
+        }
+        if let Some(&s) = self.list_index.get(&items) {
+            return s;
+        }
+        let s = Span::new(self.u32s.len() as u32, items.len() as u32);
+        self.u32s.extend(&items);
+        self.list_index.insert(items, s);
+        s
+    }
+
+    fn set(&mut self, set: &BTreeSet<usize>) -> Span {
+        self.list(set.iter().map(|&i| i as u32).collect())
+    }
+
+    /// Consecutive entries of `spans`.
+    fn spans(&mut self, items: Vec<Span>) -> Span {
+        let s = Span::new(self.spans.len() as u32, items.len() as u32);
+        self.spans.extend(items);
+        s
+    }
+
+    fn head(&mut self, head: &Head) -> u32 {
+        // `Head` equality ignores `infix`; keep the first one seen.
+        if let Some(&i) = self.head_index.get(head) {
+            return i;
+        }
+        let name = lit(self.string(&head.name));
+        let arity = lit(arity_code(head.arity));
+        let mut flags = 0u8;
+        for (on, bit) in [
+            (head.commutative, HEAD_COMMUTATIVE),
+            (head.associative, HEAD_ASSOCIATIVE),
+            (head.one_identity, HEAD_ONE_IDENTITY),
+            (head.infix, HEAD_INFIX),
+            (head.wildcard, HEAD_WILDCARD),
+        ] {
+            if on {
+                flags |= bit;
+            }
+        }
+        let flags = lit(flags);
+        let variable = lit(self.opt_string(head.head_variable.as_deref()));
+        let i = self.heads.len() as u32;
+        self.heads.push(quote!(rt::HeadDesc { name: #name, arity: #arity, flags: #flags, variable: #variable }));
+        self.head_index.insert(head.clone(), i);
+        i
+    }
+
+    fn expr(&mut self, expr: &Expr) -> u32 {
+        if let Some(&i) = self.expr_index.get(expr) {
+            return i;
+        }
+        let variable = self.opt_string(expr.variable_name());
+        let (kind, fixed, a, b, operands) = match expr.kind() {
+            ExprKind::Atom { name } => (quote!(rt::EXPR_ATOM), false, self.string(name), NONE, Span::EMPTY),
+            ExprKind::Wildcard(w) => {
+                let default = w.default.as_ref().map_or(NONE, |d| self.expr(d));
+                (quote!(rt::EXPR_WILDCARD), w.fixed_size, w.min_count as u32, default, Span::EMPTY)
+            }
+            ExprKind::Operation { head, operands } => {
+                let head = self.head(head);
+                let operands = operands.iter().map(|o| self.expr(o)).collect();
+                (quote!(rt::EXPR_OPERATION), false, head, NONE, self.list(operands))
+            }
+        };
+        let (variable, a, b, operands) = (lit(variable), lit(a), lit(b), span_tokens(operands));
+        let i = self.exprs.len() as u32;
+        self.exprs.push(quote! {
+            rt::ExprDesc { kind: #kind, fixed: #fixed, variable: #variable, a: #a, b: #b, operands: #operands }
+        });
+        self.expr_index.insert(expr.clone(), i);
+        i
+    }
+
+    fn replacement(&mut self, r: &Replacement) -> u32 {
+        let (kind, a, items) = match r {
+            Replacement::Single(e) => (quote!(rt::REPLACEMENT_SINGLE), self.expr(e), Span::EMPTY),
+            Replacement::Sequence(es) => {
+                let items = es.iter().map(|e| self.expr(e)).collect();
+                (quote!(rt::REPLACEMENT_SEQUENCE), NONE, self.list(items))
+            }
+            Replacement::Multiset(ms) => {
+                let items = ms.iter().map(|e| self.expr(e)).collect();
+                (quote!(rt::REPLACEMENT_MULTISET), NONE, self.list(items))
+            }
+            Replacement::Head(h) => (quote!(rt::REPLACEMENT_HEAD), self.head(h), Span::EMPTY),
+        };
+        let (a, items) = (lit(a), span_tokens(items));
+        let i = self.replacements.len() as u32;
+        self.replacements.push(quote!(rt::ReplacementDesc { kind: #kind, a: #a, items: #items }));
+        i
+    }
+
+    fn subst(&mut self, s: &Substitution) -> u32 {
+        let mut pairs = Vec::new();
+        for (name, value) in s {
+            pairs.push(self.string(name));
+            pairs.push(self.replacement(value));
+        }
+        let span = self.list(pairs);
+        let i = self.substs.len() as u32;
+        self.substs.push(span);
+        i
+    }
+
+    fn constraint(&mut self, c: &dyn Constraint) -> Result<u32, CompileError> {
+        let source = c.rust_source().ok_or_else(|| CompileError::UnsupportedConstraint(format!("{c:?}")))?;
+        if let Some(&i) = self.constraint_index.get(&source) {
+            return Ok(i);
+        }
+        let tokens: TokenStream =
+            source.parse().map_err(|e| CompileError::InvalidConstraintSource(format!("{source}: {e}")))?;
+        let i = self.constraints.len() as u32;
+        self.constraints.push(tokens);
+        self.constraint_index.insert(source, i);
+        Ok(i)
+    }
+
+    fn transition(&mut self, t: &TransitionInfo) -> Literal {
+        let patterns = span_tokens(self.set(&t.patterns));
+        let variable = lit(self.opt_string(t.variable_name.as_deref()));
+        let constraints = span_tokens(self.set(&t.check_constraints));
+        let subst = lit(t.subst.as_ref().map_or(NONE, |s| self.subst(s)));
+        let i = lit(self.transitions.len());
+        self.transitions.push(quote! {
+            rt::Transition { patterns: #patterns, variable: #variable, constraints: #constraints, subst: #subst }
+        });
+        i
+    }
+}
+
+/// A `static` array of `items` called `name`.
+fn table(name: &str, ty: TokenStream, items: &[TokenStream]) -> TokenStream {
+    let name = format_ident!("{}", name);
+    let n = items.len();
+    quote!(static #name: [#ty; #n] = [#(#items),*];)
+}
+
+/// A `static` array of empty cells called `name`.
+fn cells(name: &str, ty: TokenStream, n: usize) -> TokenStream {
+    let name = format_ident!("{}", name);
+    let empty = format_ident!("{}_EMPTY", name);
+    quote! {
+        const #empty: ::std::sync::OnceLock<#ty> = ::std::sync::OnceLock::new();
+        static #name: [::std::sync::OnceLock<#ty>; #n] = [#empty; #n];
+    }
+}
+
+/// Arms per constraint constructor function (no function grows with the number of constraints).
+const CONSTRAINTS_PER_FN: usize = 64;
 
 struct Generator {
     units: Vec<Unit>,
     cores: Vec<Core>,
     /// (unit, state) -> core index.
     core_of: HashMap<(usize, usize), usize>,
-    heads: Vec<Head>,
-    head_index: HashMap<Head, usize>,
-    exprs: Vec<Expr>,
-    expr_index: HashMap<Expr, usize>,
-}
-
-fn u64_lit(x: u64) -> Literal {
-    Literal::u64_suffixed(x)
-}
-
-fn usize_lit(x: usize) -> Literal {
-    Literal::usize_suffixed(x)
-}
-
-fn str_lit(s: &str) -> Literal {
-    Literal::string(s)
-}
-
-fn option_str(s: Option<&str>) -> TokenStream {
-    match s {
-        Some(s) => {
-            let s = str_lit(s);
-            quote!(::core::option::Option::Some(#s))
-        }
-        None => quote!(::core::option::Option::None),
-    }
+    tables: Tables,
 }
 
 impl Generator {
     fn new(top: AutomatonInfo) -> Self {
-        let mut g = Generator {
-            units: Vec::new(),
-            cores: Vec::new(),
-            core_of: HashMap::new(),
-            heads: Vec::new(),
-            head_index: HashMap::new(),
-            exprs: Vec::new(),
-            expr_index: HashMap::new(),
-        };
+        let mut g =
+            Generator { units: Vec::new(), cores: Vec::new(), core_of: HashMap::new(), tables: Tables::default() };
         g.add_unit(top, None);
         g
     }
 
     fn add_unit(&mut self, info: AutomatonInfo, core: Option<usize>) -> usize {
         let unit = self.units.len();
-        let commutative: Vec<(usize, omnimatch::compiled::CommutativeInfo)> =
+        let commutative: Vec<(usize, CommutativeInfo)> =
             info.states.iter().enumerate().filter_map(|(i, s)| s.commutative.clone().map(|c| (i, c))).collect();
         self.units.push(Unit { info, core });
         for (state, mut c) in commutative {
@@ -244,7 +422,7 @@ impl Generator {
                     constraint_vars: Default::default(),
                 },
             );
-            self.cores.push(Core { owner: (unit, state), operands: usize::MAX, info: c });
+            self.cores.push(Core { operands: usize::MAX, info: c, pid_sets: Span::EMPTY });
             self.core_of.insert((unit, state), core_index);
             let operands = self.add_unit(operand_info, Some(core_index));
             self.cores[core_index].operands = operands;
@@ -252,261 +430,95 @@ impl Generator {
         unit
     }
 
-    fn head(&mut self, head: &Head) -> usize {
-        if let Some(&i) = self.head_index.get(head) {
-            // `Head` equality ignores `infix`; keep the first one seen.
-            return i;
-        }
-        let i = self.heads.len();
-        self.heads.push(head.clone());
-        self.head_index.insert(head.clone(), i);
-        i
-    }
-
-    fn expr(&mut self, expr: &Expr) -> usize {
-        if let Some(&i) = self.expr_index.get(expr) {
-            return i;
-        }
-        self.intern_heads(expr);
-        let i = self.exprs.len();
-        self.exprs.push(expr.clone());
-        self.expr_index.insert(expr.clone(), i);
-        i
-    }
-
-    fn intern_heads(&mut self, expr: &Expr) {
-        match expr.kind() {
-            ExprKind::Operation { head, operands } => {
-                self.head(head);
-                for o in operands {
-                    self.intern_heads(o);
-                }
-            }
-            ExprKind::Wildcard(w) => {
-                if let Some(d) = &w.default {
-                    self.intern_heads(d);
-                }
-            }
-            ExprKind::Atom { .. } => {}
-        }
-    }
-
-    // ── value constructors (inside `new()`, where `heads` is in scope) ──
-
-    fn head_tokens(head: &Head) -> TokenStream {
-        let name = str_lit(&head.name);
-        let arity = format_ident!(
-            "{}",
-            match head.arity {
-                Arity::Nullary => "Nullary",
-                Arity::Unary => "Unary",
-                Arity::Binary => "Binary",
-                Arity::Ternary => "Ternary",
-                Arity::Variadic => "Variadic",
-            }
-        );
-        let (c, a, o, i) = (head.commutative, head.associative, head.one_identity, head.infix);
-        let wildcard = if head.wildcard {
-            let var = option_str(head.head_variable.as_deref());
-            quote!(.wildcard(#var))
-        } else {
-            quote!()
-        };
-        quote! {
-            ::omnimatch::Head::builder(#name)
-                .arity(::omnimatch::Arity::#arity)
-                .commutative(#c)
-                .associative(#a)
-                .one_identity(#o)
-                .infix(#i)
-                #wildcard
-                .build_unchecked()
-        }
-    }
-
-    fn expr_tokens(&self, expr: &Expr) -> TokenStream {
-        let var = option_str(expr.variable_name());
-        match expr.kind() {
-            ExprKind::Atom { name } => {
-                let name = str_lit(name);
-                match expr.variable_name() {
-                    None => quote!(::omnimatch::Expr::atom(#name)),
-                    Some(_) => quote!(::omnimatch::Expr::atom(#name).with_variable_name(#var)),
-                }
-            }
-            ExprKind::Wildcard(w) => {
-                let min = usize_lit(w.min_count);
-                let fixed = w.fixed_size;
-                let default = match &w.default {
-                    Some(d) => {
-                        let d = self.expr_tokens(d);
-                        quote!(::core::option::Option::Some(#d))
-                    }
-                    None => quote!(::core::option::Option::None),
-                };
-                quote!(::omnimatch::Expr::wildcard(#min, #fixed, #var, #default).unwrap())
-            }
-            ExprKind::Operation { head, operands } => {
-                let h = usize_lit(self.head_index[head]);
-                let operands = operands.iter().map(|o| self.expr_tokens(o));
-                quote!(::omnimatch::Expr::try_operation(heads[#h].clone(), vec![#(#operands),*], #var).unwrap())
-            }
-        }
-    }
-
-    fn replacement_tokens(&self, r: &Replacement) -> TokenStream {
-        match r {
-            Replacement::Single(e) => {
-                let e = self.expr_tokens(e);
-                quote!(::omnimatch::Replacement::Single(#e))
-            }
-            Replacement::Sequence(es) => {
-                let es = es.iter().map(|e| self.expr_tokens(e));
-                quote!(::omnimatch::Replacement::Sequence(vec![#(#es),*]))
-            }
-            Replacement::Multiset(ms) => {
-                let es = ms.iter().map(|e| self.expr_tokens(e));
-                quote!(::omnimatch::Replacement::Multiset(vec![#(#es),*].into_iter().collect()))
-            }
-            Replacement::Head(h) => {
-                let h = usize_lit(self.head_index[h]);
-                quote!(::omnimatch::Replacement::Head(heads[#h].clone()))
-            }
-        }
-    }
-
-    fn substitution_tokens(&self, s: &Substitution) -> TokenStream {
-        let inserts = s.iter().map(|(name, value)| {
-            let name = str_lit(name);
-            let value = self.replacement_tokens(value);
-            quote!(s.insert(#name, #value);)
-        });
-        quote!({
-            let mut s = ::omnimatch::Substitution::new();
-            #(#inserts)*
-            s
-        })
-    }
-
-    fn constraint_tokens(c: &dyn Constraint) -> Result<TokenStream, CompileError> {
-        let source = c.rust_source().ok_or_else(|| CompileError::UnsupportedConstraint(format!("{c:?}")))?;
-        let tokens: TokenStream =
-            source.parse().map_err(|e| CompileError::InvalidConstraintSource(format!("{source}: {e}")))?;
-        Ok(quote!(::std::sync::Arc::new(#tokens) as ::std::sync::Arc<dyn ::omnimatch::Constraint>))
-    }
-
-    fn intern_values(&mut self, sub: &Substitution) {
-        for (_, value) in sub {
-            match value {
-                Replacement::Single(e) => self.intern_heads(e),
-                Replacement::Sequence(es) => es.iter().for_each(|e| self.intern_heads(e)),
-                Replacement::Multiset(ms) => ms.iter().for_each(|e| self.intern_heads(e)),
-                Replacement::Head(h) => {
-                    self.head(h);
-                }
-            }
-        }
-    }
-
     fn generate(mut self, name: &Ident) -> Result<TokenStream, CompileError> {
-        // Intern every head and expression referenced by labels, keys and bindings first.
+        let mut items = Vec::new();
         for u in 0..self.units.len() {
-            let states = self.units[u].info.states.clone();
-            for state in &states {
-                for (key, ts) in &state.transitions {
-                    match key {
-                        KeyInfo::Operation(h) => {
-                            self.head(h);
-                        }
-                        KeyInfo::Atom(e) => self.intern_heads(e),
-                        _ => {}
-                    }
-                    for t in ts {
-                        match &t.label {
-                            LabelInfo::Expr(e) => {
-                                self.expr(e);
-                            }
-                            LabelInfo::Operation(h) => {
-                                self.head(h);
-                            }
-                            _ => {}
-                        }
-                        if let Some(s) = &t.subst {
-                            self.intern_values(s);
-                        }
-                    }
-                }
-            }
+            items.push(self.unit(u)?);
         }
         for c in 0..self.cores.len() {
-            if let Some(h) = self.cores[c].info.associative.clone() {
-                self.head(&h);
-            }
-            for (_, vars) in self.cores[c].info.patterns.clone() {
-                for (v, _) in vars {
-                    if let Some(d) = &v.default {
-                        self.intern_heads(d);
-                    }
-                }
-            }
+            self.core(c);
         }
 
-        let mut items = Vec::new();
-        let mut table_fields = Vec::new();
-        let mut table_inits = Vec::new();
-        for u in 0..self.units.len() {
-            let (unit_items, init) = self.unit(u)?;
-            items.push(unit_items);
-            let field = format_ident!("a{}", u);
-            table_fields.push(quote!(#field: rt::Tables));
-            table_inits.push(quote!(#field: #init));
-        }
-        let mut core_fields = Vec::new();
-        let mut core_inits = Vec::new();
-        let mut core_clears = Vec::new();
-        for (c, core) in self.cores.iter().enumerate() {
-            let field = format_ident!("c{}", c);
-            core_fields.push(quote!(#field: rt::CommutativeCore));
-            core_clears.push(quote!(self.#field.clear();));
-            let associative = match &core.info.associative {
-                Some(h) => {
-                    let h = usize_lit(self.head_index[h]);
-                    quote!(::core::option::Option::Some(heads[#h].clone()))
-                }
-                None => quote!(::core::option::Option::None),
-            };
-            let max_optional = usize_lit(core.info.max_optional_count);
-            let anonymous = core.info.anonymous_patterns.iter().map(|&i| usize_lit(i));
-            let patterns = core.info.patterns.iter().map(|(set, vars)| {
-                let set = set.iter().map(|&(i, n)| {
-                    let (i, n) = (usize_lit(i), usize_lit(n));
-                    quote!((#i, #n))
-                });
-                let vars = vars.iter().map(|(v, wrap)| self.variable_with_count(v, *wrap));
-                quote!((vec![#(#set),*], vec![#(#vars),*]))
-            });
-            core_inits.push(quote! {
-                #field: rt::CommutativeCore::new(#associative, #max_optional, { let v: ::std::vec::Vec<usize> = vec![#(#anonymous),*]; v }, vec![#(#patterns),*])
-            });
-        }
-
-        let head_inits = self.heads.iter().map(Self::head_tokens);
-        let expr_inits: Vec<TokenStream> = self.exprs.iter().map(|e| self.expr_tokens(e)).collect();
+        let t = &self.tables;
+        let constraint_fns = constraint_fns(&t.constraints);
+        let text = Literal::string(&t.text);
+        let strings: Vec<TokenStream> = t.strings.iter().map(|&s| span_tokens(s)).collect();
+        let u32s: Vec<TokenStream> = t.u32s.iter().map(|&x| lit(x).into_token_stream()).collect();
+        let spans: Vec<TokenStream> = t.spans.iter().map(|&s| span_tokens(s)).collect();
+        let substs: Vec<TokenStream> = t.substs.iter().map(|&s| span_tokens(s)).collect();
+        let statics = [
+            table("STRINGS", quote!(rt::Span), &strings),
+            table("U32S", quote!(u32), &u32s),
+            table("SPANS", quote!(rt::Span), &spans),
+            table("HEADS", quote!(rt::HeadDesc), &t.heads),
+            cells("HEAD_CELLS", quote!(::omnimatch::Head), t.heads.len()),
+            table("EXPRS", quote!(rt::ExprDesc), &t.exprs),
+            cells("EXPR_CELLS", quote!(Expr), t.exprs.len()),
+            table("REPLACEMENTS", quote!(rt::ReplacementDesc), &t.replacements),
+            table("SUBSTS", quote!(rt::Span), &substs),
+            cells("SUBST_CELLS", quote!(Substitution), t.substs.len()),
+            cells("CONSTRAINT_CELLS", quote!(::std::sync::Arc<dyn ::omnimatch::Constraint>), t.constraints.len()),
+            table("AUTOMATA", quote!(rt::AutomatonDesc), &t.automata),
+            table("TAILS", quote!(rt::TailDesc), &t.tails),
+            table("CORES", quote!(rt::CoreDesc), &t.cores),
+            table("CORE_PATTERNS", quote!(rt::CorePatternDesc), &t.core_patterns),
+            table("VARIABLES", quote!(rt::VariableDesc), &t.variables),
+            table("T", quote!(rt::Transition), &t.transitions),
+        ];
+        let core_count = self.cores.len();
+        let pid_sets = self.cores.iter().enumerate().map(|(c, core)| {
+            let name = format_ident!("PID_SETS_{}", c);
+            let span = span_tokens(core.pid_sets);
+            quote!(const #name: rt::Span = #span;)
+        });
         let module = format_ident!("__omnimatch_{}", snake_case(&name.to_string()));
-        let pattern_count = usize_lit(self.units[0].info.patterns.len());
+        let pattern_count = self.units[0].info.patterns.len();
 
         Ok(quote! {
-            #[allow(unused, non_snake_case, clippy::all, clippy::pedantic)]
+            #[allow(unused, non_snake_case, non_upper_case_globals, clippy::all, clippy::pedantic)]
             mod #module {
                 use ::omnimatch::compiled as rt;
                 use ::omnimatch::{Expr, Substitution};
 
+                static TEXT: &str = #text;
+                #(#statics)*
+                #constraint_fns
+                #(#pid_sets)*
+
+                static DATA: rt::Data = rt::Data {
+                    text: TEXT,
+                    strings: &STRINGS,
+                    u32s: &U32S,
+                    spans: &SPANS,
+                    heads: &HEADS,
+                    head_cells: &HEAD_CELLS,
+                    exprs: &EXPRS,
+                    expr_cells: &EXPR_CELLS,
+                    replacements: &REPLACEMENTS,
+                    substs: &SUBSTS,
+                    subst_cells: &SUBST_CELLS,
+                    make_constraint: make_constraint,
+                    constraint_cells: &CONSTRAINT_CELLS,
+                    automata: &AUTOMATA,
+                    tails: &TAILS,
+                    cores: &CORES,
+                    core_patterns: &CORE_PATTERNS,
+                    variables: &VARIABLES,
+                };
+
+                #[inline(always)]
+                fn tb(automaton: usize) -> rt::Tables {
+                    rt::Tables::new(&DATA, automaton)
+                }
+
                 /// A many-to-one matcher compiled by `omnimatch-compile`.
+                ///
+                /// The patterns are static data. A matcher only allocates the
+                /// commutative matchers it uses, with their caches of operand
+                /// matches; expressions and constraints are built once per
+                /// program when first needed.
                 pub struct Matcher {
-                    heads: ::std::vec::Vec<::omnimatch::Head>,
-                    exprs: ::std::vec::Vec<Expr>,
-                    #(#table_fields,)*
-                    #(#core_fields,)*
+                    cores: ::std::boxed::Box<[::std::cell::OnceCell<rt::CommutativeCore>]>,
                 }
 
                 impl ::core::default::Default for Matcher {
@@ -526,19 +538,20 @@ impl Generator {
                     pub const PATTERN_COUNT: usize = #pattern_count;
 
                     pub fn new() -> Self {
-                        let heads: ::std::vec::Vec<::omnimatch::Head> = vec![#(#head_inits),*];
-                        let exprs: ::std::vec::Vec<Expr> = vec![#(#expr_inits),*];
-                        Matcher {
-                            #(#table_inits,)*
-                            #(#core_inits,)*
-                            heads,
-                            exprs,
-                        }
+                        Matcher { cores: (0..#core_count).map(|_| ::std::cell::OnceCell::new()).collect() }
+                    }
+
+                    fn core(&self, c: usize) -> &rt::CommutativeCore {
+                        self.cores[c].get_or_init(|| DATA.core(c))
                     }
 
                     /// Drop the operands cached by the commutative matchers.
                     pub fn clear(&self) {
-                        #(#core_clears)*
+                        for core in self.cores.iter() {
+                            if let ::core::option::Option::Some(core) = core.get() {
+                                core.clear();
+                            }
+                        }
                     }
 
                     /// Call `on_group` with the matches reaching each final state
@@ -548,7 +561,7 @@ impl Generator {
                         subject: &Expr,
                         on_group: &mut dyn FnMut(::std::vec::Vec<(usize, Substitution)>) -> rt::Flow,
                     ) -> rt::Flow {
-                        rt::for_each_group(self, &self.a0, a0_s0, subject, on_group)
+                        rt::for_each_group(self, tb(0), a0_s0, subject, on_group)
                     }
 
                     /// Call `on_match` with the pattern index and substitution of every match.
@@ -601,63 +614,61 @@ impl Generator {
         })
     }
 
-    fn variable_with_count(&self, v: &VariableWithCount, wrap: bool) -> TokenStream {
-        let name = option_str(v.name.as_deref());
-        let (count, minimum) = (usize_lit(v.count), usize_lit(v.minimum));
-        let default = match &v.default {
-            Some(d) => {
-                let d = self.expr_tokens(d);
-                quote!(::core::option::Option::Some(#d))
+    /// The static data of commutative core `c` (after its automata).
+    fn core(&mut self, c: usize) {
+        let info = &self.cores[c].info;
+        let t = &mut self.tables;
+        let associative = lit(info.associative.as_ref().map_or(NONE, |h| t.head(h)));
+        let max_optional = lit(info.max_optional_count);
+        let anonymous = span_tokens(t.set(&info.anonymous_patterns));
+        let first = t.core_patterns.len();
+        for (operands, variables) in &info.patterns {
+            let operands = operands.iter().flat_map(|&(id, n)| [id as u32, n as u32]).collect();
+            let operands = span_tokens(t.list(operands));
+            let first_var = t.variables.len();
+            for (v, wrap) in variables {
+                let name = lit(t.opt_string(v.name.as_deref()));
+                let (count, minimum) = (lit(v.count), lit(v.minimum));
+                let default = lit(v.default.as_ref().map_or(NONE, |d| t.expr(d)));
+                t.variables.push(quote! {
+                    rt::VariableDesc { name: #name, count: #count, minimum: #minimum, default: #default, wrap: #wrap }
+                });
             }
-            None => quote!(::core::option::Option::None),
-        };
-        quote!((::omnimatch::utils::VariableWithCount::new(#name, #count, #minimum, #default), #wrap))
+            let vars = span_tokens(Span::new(first_var as u32, (t.variables.len() - first_var) as u32));
+            t.core_patterns.push(quote!(rt::CorePatternDesc { operands: #operands, variables: #vars }));
+        }
+        let patterns = span_tokens(Span::new(first as u32, (t.core_patterns.len() - first) as u32));
+        t.cores.push(quote! {
+            rt::CoreDesc {
+                associative: #associative,
+                max_optional_count: #max_optional,
+                anonymous_patterns: #anonymous,
+                patterns: #patterns,
+            }
+        });
     }
 
-    /// The items of one automaton, and the expression building its `Tables`.
-    fn unit(&self, u: usize) -> Result<(TokenStream, TokenStream), CompileError> {
-        let info = &self.units[u].info;
-        let n_words = (info.patterns.len() + 63) / 64;
-        let bits = |set: &std::collections::BTreeSet<usize>| -> TokenStream {
-            let mut words = vec![0u64; n_words];
-            for &p in set {
-                words[p / 64] |= 1 << (p % 64);
-            }
-            let words = words.into_iter().map(u64_lit);
-            quote!(&[#(#words),*])
-        };
-        let tables = format_ident!("a{}", u);
+    /// The functions of automaton `u`; adds its static data to the tables.
+    fn unit(&mut self, u: usize) -> Result<TokenStream, CompileError> {
+        let info = std::mem::replace(
+            &mut self.units[u].info,
+            AutomatonInfo {
+                states: Vec::new(),
+                finals: Default::default(),
+                patterns: Vec::new(),
+                constraints: Vec::new(),
+                constraint_vars: Default::default(),
+            },
+        );
+        let result = self.unit_with(u, &info);
+        self.units[u].info = info;
+        result
+    }
+
+    fn unit_with(&mut self, u: usize, info: &AutomatonInfo) -> Result<TokenStream, CompileError> {
         let state_fn = |s: usize| format_ident!("a{}_s{}", u, s);
         let end_fn = format_ident!("a{}_end", u);
-
-        let mut statics = Vec::new();
-        let mut substs: Vec<TokenStream> = Vec::new();
-        let mut transition_count = 0usize;
-        // Emit the static data of a transition and return its name.
-        let mut transition = |t: &TransitionInfo, statics: &mut Vec<TokenStream>, substs: &mut Vec<TokenStream>| {
-            let ident = format_ident!("A{}_T{}", u, transition_count);
-            transition_count += 1;
-            let patterns = bits(&t.patterns);
-            let variable = option_str(t.variable_name.as_deref());
-            let constraints = t.check_constraints.iter().map(|&c| usize_lit(c));
-            let subst = match &t.subst {
-                Some(s) => {
-                    let i = usize_lit(substs.len());
-                    substs.push(self.substitution_tokens(s));
-                    quote!(::core::option::Option::Some(#i))
-                }
-                None => quote!(::core::option::Option::None),
-            };
-            statics.push(quote! {
-                static #ident: rt::Transition = rt::Transition {
-                    patterns: #patterns,
-                    variable: #variable,
-                    constraints: &[#(#constraints),*],
-                    subst: #subst,
-                };
-            });
-            ident
-        };
+        let ul = lit(u);
 
         let mut fns = Vec::new();
         let mut end_arms = Vec::new();
@@ -672,13 +683,15 @@ impl Generator {
             for (key, ts) in &state.transitions {
                 match key {
                     KeyInfo::End => {
-                        let calls = ts.iter().map(|t| {
-                            let ident = transition(t, &mut statics, &mut substs);
-                            let next = state_fn(t.target);
-                            quote!(rt::check_transition(m, &m.#tables, r, &#ident, ::core::option::Option::None, #next, k)?;)
-                        });
-                        let s_lit = usize_lit(s);
-                        let calls: Vec<TokenStream> = calls.collect();
+                        let calls: Vec<TokenStream> = ts
+                            .iter()
+                            .map(|t| {
+                                let id = self.tables.transition(t);
+                                let next = state_fn(t.target);
+                                quote!(rt::check_transition(m, tb(#ul), r, &T[#id], ::core::option::Option::None, #next, k)?;)
+                            })
+                            .collect();
+                        let s_lit = lit(s);
                         end_arms.push(quote!(#s_lit => { #(#calls)* }));
                         continue;
                     }
@@ -688,23 +701,23 @@ impl Generator {
                 let calls: Vec<TokenStream> = ts
                     .iter()
                     .map(|t| {
-                        let ident = transition(t, &mut statics, &mut substs);
-                        self.transition_call(u, t, &ident)
+                        let id = self.tables.transition(t);
+                        self.transition_call(u, t, &id)
                     })
                     .collect();
                 match key {
                     KeyInfo::Operation(h) => {
-                        let sel = usize_lit(next_sel);
+                        let sel = lit(next_sel);
                         next_sel += 1;
-                        let name = str_lit(&h.name);
-                        let hi = usize_lit(self.head_index[h]);
-                        op_arms.push(quote!(#name if head == &m.heads[#hi] => #sel,));
+                        let name = Literal::string(&h.name);
+                        let hi = lit(self.tables.head(h));
+                        op_arms.push(quote!(#name if DATA.head_is(head, #hi) => #sel,));
                         keyed_bodies.push(quote!(#sel => { #(#calls)* }));
                     }
                     KeyInfo::Atom(e) => {
-                        let sel = usize_lit(next_sel);
+                        let sel = lit(next_sel);
                         next_sel += 1;
-                        let name = str_lit(e.atom_name().expect("atom key"));
+                        let name = Literal::string(e.atom_name().expect("atom key"));
                         atom_arms.push(quote!(#name => #sel,));
                         keyed_bodies.push(quote!(#sel => { #(#calls)* }));
                     }
@@ -715,7 +728,7 @@ impl Generator {
             }
             let has_end = state.transitions.iter().any(|(k, _)| *k == KeyInfo::End);
             let report = if info.finals.contains(&s) || has_end {
-                let s_lit = usize_lit(s);
+                let s_lit = lit(s);
                 quote!(if sel == 0 { k(r, #s_lit)?; })
             } else {
                 quote!()
@@ -725,7 +738,7 @@ impl Generator {
             let any_op = if any_op.is_empty() { quote!() } else { quote!(if is_operation { #(#any_op)* }) };
             fns.push(quote! {
                 fn #this(m: &Matcher, r: &mut rt::Run, k: rt::K<'_>) -> rt::Flow {
-                    let (sel, is_operation): (usize, bool) = match rt::front(r) {
+                    let (sel, is_operation): (u32, bool) = match rt::front(r) {
                         rt::Front::None => (0, false),
                         rt::Front::Operation(head) => (match head.name.as_str() { #(#op_arms)* _ => 1 }, true),
                         rt::Front::Atom(name) => (match name { #(#atom_arms)* _ => 2 }, false),
@@ -741,40 +754,39 @@ impl Generator {
 
             // A commutative state: dispatch on the matched commutative pattern id.
             if let Some(&c) = self.core_of.get(&(u, s)) {
-                let core = &self.cores[c];
                 let pid_fn = format_ident!("a{}_pid{}", u, s);
-                let pid_static = format_ident!("A{}_PID{}", u, s);
                 let mut unions = Vec::new();
                 let mut arms = Vec::new();
-                for pid in 0..core.info.patterns.len() {
+                for pid in 0..self.cores[c].info.patterns.len() {
                     let ts: Vec<&TransitionInfo> = state
                         .transitions
                         .iter()
                         .filter(|(k, _)| *k == KeyInfo::PatternId(pid))
                         .flat_map(|(_, ts)| ts)
                         .collect();
-                    let union: std::collections::BTreeSet<usize> =
-                        ts.iter().flat_map(|t| t.patterns.iter().copied()).collect();
-                    unions.push(bits(&union));
+                    let union: BTreeSet<usize> = ts.iter().flat_map(|t| t.patterns.iter().copied()).collect();
+                    unions.push(self.tables.set(&union));
                     let calls: Vec<TokenStream> = ts
                         .iter()
                         .map(|t| {
-                            let ident = transition(t, &mut statics, &mut substs);
+                            let id = self.tables.transition(t);
                             let next = state_fn(t.target);
                             quote! {
                                 rt::check_transition(
-                                    m, &m.#tables, r, &#ident,
+                                    m, tb(#ul), r, &T[#id],
                                     ::core::option::Option::Some(::omnimatch::Replacement::Single(subject.clone())),
                                     #next, k,
                                 )?;
                             }
                         })
                         .collect();
-                    let pid = usize_lit(pid);
-                    arms.push(quote!(#pid => { #(#calls)* }));
+                    if !calls.is_empty() {
+                        let pid = lit(pid);
+                        arms.push(quote!(#pid => { #(#calls)* }));
+                    }
                 }
+                self.cores[c].pid_sets = self.tables.spans(unions);
                 fns.push(quote! {
-                    static #pid_static: &[&[u64]] = &[#(#unions),*];
                     fn #pid_fn(m: &Matcher, r: &mut rt::Run, pid: usize, subject: &Expr, k: rt::K<'_>) -> rt::Flow {
                         match pid {
                             #(#arms)*
@@ -799,100 +811,132 @@ impl Generator {
         // An operand automaton: its entry point for the commutative core.
         if let Some(c) = self.units[u].core {
             let operands_fn = format_ident!("a{}_operands", u);
-            let core_field = format_ident!("c{}", c);
             let root = state_fn(0);
+            let c = lit(c);
             fns.push(quote! {
                 fn #operands_fn(m: &Matcher, subject: ::core::option::Option<&Expr>) -> ::std::vec::Vec<(usize, Substitution)> {
-                    rt::operand_matches(m, &m.#tables, #root, subject, m.#core_field.associative())
+                    rt::operand_matches(m, tb(#ul), #root, subject, m.core(#c).associative())
                 }
             });
         }
 
-        // The tables.
-        let constraints =
-            info.constraints.iter().map(|(c, _)| Self::constraint_tokens(c.as_ref())).collect::<Result<Vec<_>, _>>()?;
-        let constraint_patterns = info.constraints.iter().map(|(_, ps)| bits(ps));
-        let constraint_vars = info.constraint_vars.iter().map(|(v, cs)| {
-            let v = str_lit(v);
-            let cs = cs.iter().map(|&c| usize_lit(c));
-            quote!((#v, &[#(#cs),*] as &'static [usize]))
-        });
-        let tails = info
-            .patterns
-            .iter()
-            .map(|p| {
-                let inverse: BTreeMap<&String, &String> = p.renaming.iter().map(|(o, r)| (r, o)).collect();
-                let inverse = inverse.into_iter().map(|(r, o)| {
-                    let (r, o) = (str_lit(r), str_lit(o));
-                    quote!((#r.to_owned(), #o.to_owned()))
-                });
-                let globals = if self.units[u].core.is_none() {
-                    p.pattern
-                        .global_constraints()
-                        .iter()
-                        .map(|c| Self::constraint_tokens(c.as_ref()))
-                        .collect::<Result<Vec<_>, _>>()?
-                } else {
-                    Vec::new()
-                };
-                Ok(quote! {
-                    rt::PatternTail {
-                        inverse_renaming: vec![#(#inverse),*].into_iter().collect(),
-                        global_constraints: vec![#(#globals),*],
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, CompileError>>()?;
-        let pattern_count = usize_lit(info.patterns.len());
-        let init = quote! {
-            rt::Tables {
+        // The automaton's tables.
+        let t = &mut self.tables;
+        let mut constraint_ids = Vec::new();
+        let mut constraint_patterns = Vec::new();
+        for (c, patterns) in &info.constraints {
+            constraint_ids.push(t.constraint(c.as_ref())?);
+            constraint_patterns.push(t.set(patterns));
+        }
+        let constraints = span_tokens(t.list(constraint_ids));
+        let constraint_patterns = span_tokens(t.spans(constraint_patterns));
+        let mut triples = Vec::new();
+        for (var, cs) in &info.constraint_vars {
+            // Sorted by name: `BTreeMap<String, _>` orders like `str`.
+            let name = t.string(var);
+            let list = t.set(cs);
+            triples.extend([name, list.off, list.len]);
+        }
+        let constraint_vars = span_tokens(t.list(triples));
+        let first_tail = t.tails.len();
+        for p in &info.patterns {
+            let inverse: BTreeMap<&String, &String> = p.renaming.iter().map(|(o, r)| (r, o)).collect();
+            let pairs = inverse.into_iter().flat_map(|(r, o)| [t.string(r), t.string(o)]).collect::<Vec<_>>();
+            let inverse = span_tokens(t.list(pairs));
+            let globals = if self.units[u].core.is_none() {
+                p.pattern
+                    .global_constraints()
+                    .iter()
+                    .map(|c| t.constraint(c.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            let globals = span_tokens(t.list(globals));
+            t.tails.push(quote!(rt::TailDesc { inverse_renaming: #inverse, global_constraints: #globals }));
+        }
+        let tails = span_tokens(Span::new(first_tail as u32, info.patterns.len() as u32));
+        let pattern_count = lit(info.patterns.len());
+        t.automata.push(quote! {
+            rt::AutomatonDesc {
                 pattern_count: #pattern_count,
-                substs: vec![#(#substs),*],
-                constraints: vec![#(#constraints),*],
-                constraint_patterns: vec![#(#constraint_patterns),*],
-                constraint_vars: vec![#(#constraint_vars),*].into_iter().collect(),
-                patterns: vec![#(#tails),*],
+                constraints: #constraints,
+                constraint_patterns: #constraint_patterns,
+                constraint_vars: #constraint_vars,
+                tails: #tails,
             }
-        };
-        Ok((quote!(#(#statics)* #(#fns)*), init))
+        });
+        Ok(quote!(#(#fns)*))
     }
 
-    /// The call taking transition `t` (static data `ident`) of automaton `u`.
-    fn transition_call(&self, u: usize, t: &TransitionInfo, ident: &Ident) -> TokenStream {
-        let tables = format_ident!("a{}", u);
+    /// The call taking transition `t` (index `id` of `T`) of automaton `u`.
+    fn transition_call(&mut self, u: usize, t: &TransitionInfo, id: &Literal) -> TokenStream {
+        let ul = lit(u);
         let next = format_ident!("a{}_s{}", u, t.target);
         match &t.label {
-            LabelInfo::Epsilon => quote!(rt::epsilon(m, &m.#tables, r, &#ident, #next, k)?;),
-            LabelInfo::End => quote!(rt::consume(m, &m.#tables, r, &#ident, #next, k)?;),
+            LabelInfo::Epsilon => quote!(rt::epsilon(m, tb(#ul), r, &T[#id], #next, k)?;),
+            LabelInfo::End => quote!(rt::consume(m, tb(#ul), r, &T[#id], #next, k)?;),
             LabelInfo::Expr(e) if e.is_wildcard() => {
-                let e = usize_lit(self.expr_index[e]);
-                quote!(rt::wildcard(m, &m.#tables, r, &#ident, &m.exprs[#e], #next, k)?;)
+                let e = lit(self.tables.expr(e));
+                quote!(rt::wildcard(m, tb(#ul), r, &T[#id], #e, #next, k)?;)
             }
-            LabelInfo::Expr(_) => quote!(rt::consume(m, &m.#tables, r, &#ident, #next, k)?;),
+            LabelInfo::Expr(_) => quote!(rt::consume(m, tb(#ul), r, &T[#id], #next, k)?;),
             LabelInfo::Operation(head) => match self.core_of.get(&(u, t.target)) {
                 Some(&c) => {
-                    let core = &self.cores[c];
-                    debug_assert_eq!(core.owner, (u, t.target));
-                    let core_field = format_ident!("c{}", c);
-                    let operands_fn = format_ident!("a{}_operands", core.operands);
+                    let operands_fn = format_ident!("a{}_operands", self.cores[c].operands);
                     let pid_fn = format_ident!("a{}_pid{}", u, t.target);
-                    let pid_static = format_ident!("A{}_PID{}", u, t.target);
-                    quote!(rt::commutative_operation(m, &m.#tables, r, &#ident, &m.#core_field, #operands_fn, #pid_static, #pid_fn, k)?;)
+                    let pid_sets = format_ident!("PID_SETS_{}", c);
+                    let c = lit(c);
+                    quote!(rt::commutative_operation(m, tb(#ul), r, &T[#id], m.core(#c), #operands_fn, #pid_sets, #pid_fn, k)?;)
                 }
                 None => {
-                    let h = usize_lit(self.head_index[head]);
+                    let h = lit(self.tables.head(head));
                     let end_fn = format_ident!("a{}_end", u);
-                    quote!(rt::regular_operation(m, &m.#tables, r, &#ident, &m.heads[#h], #next, #end_fn, k)?;)
+                    quote!(rt::regular_operation(m, tb(#ul), r, &T[#id], #h, #next, #end_fn, k)?;)
                 }
             },
         }
     }
 }
 
+/// `make_constraint(i)`, split into functions of at most [`CONSTRAINTS_PER_FN`] arms.
+fn constraint_fns(constraints: &[TokenStream]) -> TokenStream {
+    let ty = quote!(::std::sync::Arc<dyn ::omnimatch::Constraint>);
+    let mut chunks = Vec::new();
+    let mut dispatch = Vec::new();
+    for (n, chunk) in constraints.chunks(CONSTRAINTS_PER_FN).enumerate() {
+        let f = format_ident!("make_constraint_{}", n);
+        let arms = chunk.iter().enumerate().map(|(j, c)| {
+            let i = lit(n * CONSTRAINTS_PER_FN + j);
+            quote!(#i => ::std::sync::Arc::new(#c),)
+        });
+        chunks.push(quote! {
+            fn #f(i: u32) -> #ty {
+                match i {
+                    #(#arms)*
+                    _ => unreachable!(),
+                }
+            }
+        });
+        let n_lit = lit(n);
+        dispatch.push(quote!(#n_lit => #f(i),));
+    }
+    let per = lit(CONSTRAINTS_PER_FN);
+    quote! {
+        fn make_constraint(i: u32) -> #ty {
+            match i / #per {
+                #(#dispatch)*
+                _ => unreachable!(),
+            }
+        }
+        #(#chunks)*
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omnimatch::{make_dot_variable, CustomConstraint, FreeOf};
+    use omnimatch::{make_dot_variable, Arity, CustomConstraint, FreeOf};
     use std::sync::Arc;
 
     fn f() -> Head {
