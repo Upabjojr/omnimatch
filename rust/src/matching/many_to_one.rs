@@ -483,6 +483,17 @@ impl<T> ManyToOneMatcher<T> {
         it.match_state(ROOT, &mut |it, _state| {
             let mut group = Vec::new();
             for index in it.patterns.iter() {
+                // the constraints not checked on the way: those on the
+                // defaults a one-identity shortcut binds (`Transition::subst`)
+                // are left for the complete match, which is cheaper than
+                // checking them in every partial one
+                let (_, local) = &automaton.patterns[index];
+                let unchecked = local.iter().map(|&c| &automaton.constraints[c].0).zip(local).filter(|(c, &i)| {
+                    it.active_constraints[i] && c.variables().iter().all(|v| it.substitution.contains(v))
+                });
+                if !unchecked.into_iter().all(|(c, _)| c.check(&it.substitution)) {
+                    continue;
+                }
                 let inverse: HashMap<String, String> = automaton.pattern_vars[index]
                     .iter()
                     .map(|(orig, renamed)| (renamed.clone(), orig.clone()))
@@ -658,6 +669,8 @@ impl<'a> MatchIter<'a> {
                         break 'body CONTINUE;
                     }
                 }
+            }
+            if t.variable_name.is_some() {
                 self.check_constraints(ConstraintSource::Indices(&t.check_constraints), &mut restore_constraints);
                 if self.patterns.is_empty() {
                     break 'body CONTINUE;

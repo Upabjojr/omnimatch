@@ -1198,3 +1198,28 @@ fn replacer() {
     assert_eq!(replacer.replace(&expr, Some(1)).unwrap(), one(f(&[b()])));
     assert_eq!(replacer.replace_post_order(&expr).unwrap(), b());
 }
+
+#[test]
+fn one_identity_defaults_are_checked_against_constraints() {
+    // Int[Px_^p_. * Fx_., x] with the constraint p < 0 must not match a plain
+    // sum: the shortcut binds the defaults p = 1, Fx = 1, and p's constraint
+    // has to see them (it was skipped, so the rule matched anyway)
+    let int = Head::new("Int", Arity::Binary).unwrap();
+    let add = Head::builder("+").infix(true).associative(true).commutative(true).one_identity(true).build().unwrap();
+    let mul = Head::builder("*").infix(true).associative(true).commutative(true).one_identity(true).build().unwrap();
+    // variadic so that one_identity lets a bare base match `b^p_.` (as Rubi's Power)
+    let pow = Head::builder("^").infix(true).one_identity(true).build().unwrap();
+    let (i1, x) = (Expr::atom("1"), Expr::atom("x"));
+    let body = mul.call(vec![
+        pow.call(vec![make_dot_variable("Px"), Expr::optional("p", i1.clone())]),
+        Expr::optional("Fx", i1.clone()),
+    ]);
+    let negative: Arc<dyn Constraint> =
+        Arc::new(CustomConstraint::new(["p"], |args: &[&Replacement]| args[0].to_string().starts_with('-')));
+    let mut matcher = ManyToOneMatcher::new();
+    matcher.add_with_label(Pattern::with_constraints(int.call(vec![body, x.clone()]), vec![negative]), 1);
+    let sum = add.call(vec![a(), x.clone()]);
+    assert!(matcher.match_all(&int.call(vec![sum.clone(), x.clone()])).is_empty());
+    let reciprocal = pow.call(vec![sum, Expr::atom("-1")]);
+    assert_eq!(matcher.match_all(&int.call(vec![reciprocal, x.clone()])).len(), 1);
+}
