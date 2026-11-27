@@ -36,6 +36,7 @@ impl BitSet {
         self.words[w] |= 1 << (i % 64);
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, i: usize) -> bool {
         self.words.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
