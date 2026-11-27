@@ -31,6 +31,7 @@ use crate::constraints::{Constraint, ConstraintRef};
 use crate::expressions::{Expr, ExprKind, Head, Pattern, WildcardSpec};
 use crate::functions::{replace, ReplacementFn, ReplacementRule, RewriteError};
 use crate::matching::bipartite::{enum_maximum_matchings, BipartiteGraph, Matching};
+use crate::matching::bitset::BitSet;
 use crate::matching::common::check_one_identity;
 use crate::multiset::Multiset;
 use crate::substitution::{Replacement, Substitution};
@@ -77,6 +78,8 @@ struct Transition {
     variable_name: Option<String>,
     /// The patterns that use this transition.
     patterns: BTreeSet<usize>,
+    /// `patterns` as a bit set (what the search intersects with).
+    bits: BitSet,
     /// Constraints to check after binding `variable_name`.
     check_constraints: BTreeSet<usize>,
     /// Bindings added when taking the transition (defaults for one-identity shortcuts).
@@ -100,6 +103,8 @@ struct Automaton {
     pattern_vars: Vec<HashMap<String, String>>,
     /// Each local constraint and the patterns it belongs to.
     constraints: Vec<(Arc<dyn Constraint>, BTreeSet<usize>)>,
+    /// The pattern sets of `constraints` as bit sets.
+    constraint_bits: Vec<BitSet>,
     constraint_vars: HashMap<String, BTreeSet<usize>>,
     finals: HashSet<usize>,
     pattern_to_index: HashMap<Pattern, usize>,
@@ -117,6 +122,7 @@ impl Automaton {
             states: vec![State::default()],
             pattern_vars: Vec::new(),
             constraints: Vec::new(),
+            constraint_bits: Vec::new(),
             constraint_vars: HashMap::new(),
             finals: HashSet::new(),
             pattern_to_index: HashMap::new(),
@@ -203,11 +209,13 @@ impl Automaton {
         let index = match self.constraint_to_index.get(&key) {
             Some(&index) => {
                 self.constraints[index].1.insert(pattern);
+                self.constraint_bits[index].insert(pattern);
                 index
             }
             None => {
                 let index = self.constraints.len();
                 self.constraints.push((constraint.clone(), BTreeSet::from([pattern])));
+                self.constraint_bits.push(BitSet::singleton(pattern));
                 self.constraint_to_index.insert(key, index);
                 index
             }
@@ -241,6 +249,7 @@ impl Automaton {
         for t in transitions.iter_mut() {
             if t.variable_name == variable_name && t.label == label && t.subst == subst {
                 t.patterns.insert(index);
+                t.bits.insert(index);
                 t.check_constraints.extend(new_constraints);
                 return t.target;
             }
@@ -258,6 +267,7 @@ impl Automaton {
             target,
             variable_name,
             patterns: BTreeSet::from([index]),
+            bits: BitSet::singleton(index),
             check_constraints: new_constraints,
             subst,
         });
@@ -267,6 +277,7 @@ impl Automaton {
     fn create_simple_transition(&mut self, state: usize, key: Key, index: usize) -> usize {
         if let Some(ts) = self.states[state].transitions.get_mut(&key) {
             ts[0].patterns.insert(index);
+            ts[0].bits.insert(index);
             return ts[0].target;
         }
         let target = self.states.len();
@@ -279,6 +290,7 @@ impl Automaton {
                 target,
                 variable_name: None,
                 patterns: BTreeSet::from([index]),
+                bits: BitSet::singleton(index),
                 check_constraints: BTreeSet::new(),
                 subst: None,
             }],
@@ -470,7 +482,7 @@ impl<T> ManyToOneMatcher<T> {
         let mut it = MatchIter::new(automaton, Some(subject.clone()), None);
         it.match_state(ROOT, &mut |it, _state| {
             let mut group = Vec::new();
-            for &index in &it.patterns {
+            for index in it.patterns.iter() {
                 let inverse: HashMap<String, String> = automaton.pattern_vars[index]
                     .iter()
                     .map(|(orig, renamed)| (renamed.clone(), orig.clone()))
@@ -521,7 +533,7 @@ struct MatchIter<'a> {
     automaton: &'a Automaton,
     subjects: VecDeque<Expr>,
     /// Patterns still viable on the current path.
-    patterns: BTreeSet<usize>,
+    patterns: BitSet,
     substitution: Substitution,
     /// Constraints not yet checked on the current path.
     active_constraints: Vec<bool>,
@@ -541,7 +553,7 @@ impl<'a> MatchIter<'a> {
         MatchIter {
             automaton,
             subjects: subject.into_iter().collect(),
-            patterns: (0..automaton.patterns.len()).collect(),
+            patterns: BitSet::full(automaton.patterns.len()),
             substitution: Substitution::new(),
             active_constraints: vec![true; automaton.constraints.len()],
             associative: vec![associative],
@@ -576,7 +588,7 @@ impl<'a> MatchIter<'a> {
     }
 
     fn match_transition(&mut self, t: &'a Transition, k: K<'_, 'a>) -> Flow {
-        if self.patterns.is_disjoint(&t.patterns) {
+        if self.patterns.is_disjoint(&t.bits) {
             return CONTINUE;
         }
         match &t.label {
@@ -622,11 +634,11 @@ impl<'a> MatchIter<'a> {
     /// Take transition `t`, binding its variable to `subject`, and continue
     /// from its target. Every change is undone before returning.
     fn check_transition(&mut self, t: &'a Transition, subject: Option<Replacement>, k: K<'_, 'a>) -> Flow {
-        if self.patterns.is_disjoint(&t.patterns) {
+        let narrowed = self.patterns.intersection(&t.bits);
+        if narrowed.is_empty() {
             return CONTINUE;
         }
-        let saved_patterns = self.patterns.clone();
-        self.patterns = self.patterns.intersection(&t.patterns).copied().collect();
+        let saved_patterns = std::mem::replace(&mut self.patterns, narrowed);
         let mut old_values: Vec<(String, Option<Replacement>)> = Vec::new();
         let mut restore_constraints = Vec::new();
 
@@ -682,7 +694,7 @@ impl<'a> MatchIter<'a> {
                     gathered = self
                         .patterns
                         .iter()
-                        .filter_map(|&p| automaton.constraint_pattern_map.get(&(var.to_owned(), p)))
+                        .filter_map(|p| automaton.constraint_pattern_map.get(&(var.to_owned(), p)))
                         .flatten()
                         .copied()
                         .collect();
@@ -696,13 +708,17 @@ impl<'a> MatchIter<'a> {
             if !self.active_constraints[index] {
                 continue;
             }
-            let (constraint, patterns) = &automaton.constraints[index];
+            let constraint = &automaton.constraints[index].0;
+            let patterns = &automaton.constraint_bits[index];
+            if self.patterns.is_disjoint(patterns) {
+                continue;
+            }
             let all_bound = constraint.variables().iter().all(|v| self.substitution.contains(v));
-            if all_bound && !self.patterns.is_disjoint(patterns) {
+            if all_bound {
                 self.active_constraints[index] = false;
                 restore_constraints.push(index);
                 if !constraint.check(&self.substitution) {
-                    self.patterns.retain(|p| !patterns.contains(p));
+                    self.patterns.difference_with(patterns);
                     if self.patterns.is_empty() {
                         break;
                     }
@@ -848,8 +864,11 @@ impl<'a> MatchIter<'a> {
                 new_substitution.iter().map(|(k, _)| k).filter(|k| !original.contains(k)).cloned().collect();
             self.substitution = new_substitution;
             let transition_set = &transitions[&Key::PatternId(matched_pattern)];
-            let potential: BTreeSet<usize> = transition_set.iter().flat_map(|t| t.patterns.iter().copied()).collect();
-            self.patterns = saved_patterns.intersection(&potential).copied().collect();
+            let mut potential = BitSet::new();
+            for t in transition_set {
+                potential.union_with(&t.bits);
+            }
+            self.patterns = saved_patterns.intersection(&potential);
             let mut restore_constraints = Vec::new();
             for var in &diff {
                 self.check_constraints(ConstraintSource::Variable(var), &mut restore_constraints);
@@ -1038,7 +1057,7 @@ impl CommutativeMatcher {
         let mut it = MatchIter::new(&self.automaton, subject.cloned(), self.core.associative.clone());
         let mut out = Vec::new();
         let _ = it.match_state(ROOT, &mut |it, _| {
-            for &index in &it.patterns {
+            for index in it.patterns.iter() {
                 out.push((index, it.substitution.clone()));
             }
             CONTINUE

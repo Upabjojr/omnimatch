@@ -6,6 +6,7 @@
 //! Not yet ported: code generation and JSON serialization.
 
 pub mod bipartite;
+mod bitset;
 pub mod common;
 pub mod hopcroft_karp;
 pub mod many_to_one;
